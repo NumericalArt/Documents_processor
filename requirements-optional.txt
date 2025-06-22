@@ -1,0 +1,10 @@
+# Optional Dependencies for Documents Processor
+# These enhance functionality but are not required for basic operation
+
+# AI-powered image descriptions
+# Requires OpenAI API key configuration
+openai>=1.0.0
+
+# RAR archive support
+# Also requires unrar or bsdtar system tools
+rarfile>=4.0
