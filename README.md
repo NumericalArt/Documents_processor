@@ -189,7 +189,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## 🔗 Related Projects
 
 - [PyMuPDF](https://pymupdf.readthedocs.io/) - PDF processing
-- [Tesseract](https://github.com/tesseract-ocr/tesseract) - OCR engine
 - [OpenAI](https://openai.com/) - AI image analysis
 
 ---
