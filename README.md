@@ -42,11 +42,10 @@ A comprehensive Python utility for processing and extracting content from variou
 pip install -r requirements.txt
 
 # Install system dependencies (macOS with Homebrew)
-brew install tesseract
 brew install --cask libreoffice
 
 # Install system dependencies (Ubuntu/Debian)
-sudo apt-get install tesseract-ocr libreoffice
+sudo apt-get install libreoffice
 ```
 
 ### Basic Usage
@@ -125,7 +124,6 @@ MAX_VISION_CALLS_PER_PAGE=50
 ## 🛠️ System Requirements
 
 - **Python**: 3.7 or higher
-- **Required**: Tesseract OCR
 - **Optional**: LibreOffice (for advanced document conversion)
 - **Optional**: OpenAI API key (for AI image descriptions)
 - **Optional**: unrar or bsdtar (for RAR archive support)
