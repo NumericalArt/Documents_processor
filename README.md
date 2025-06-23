@@ -92,7 +92,7 @@ python cleanup_utility.py --all --backup
 
 | Category | Formats | Capabilities | Requirements |
 |----------|---------|-------------|--------------|
-| **Documents** | PDF, DOCX, DOC, RTF, TXT, MD, ODT, EPUB | Text + embedded images + tables | Core installation |
+| **Documents** | PDF, DOCX, DOC, RTF, TXT, MD, ODT, EPUB, PY, JSON | Text + embedded images + tables | Core installation |
 | **Spreadsheets** | XLSX, XLS, CSV | Data extraction + table export | Core installation |
 | **Presentations** | PPTX, PPT | Text + images + slide structure | LibreOffice |
 | **Images** | JPG, PNG, HEIC, HEIF, GIF, TIFF, BMP | OCR + AI descriptions + EXIF | Core installation |
