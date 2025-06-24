@@ -1,0 +1,58 @@
+{
+  "default_model": "gpt-4o-mini",
+  "fallback_model": "gpt-4o-mini",
+  "default_schema": "default_schema.json",
+  "timeout_seconds": 120,
+  "temperature": 0.1,
+  "max_tokens": 4000,
+  "openai": {
+    "model": "gpt-4o-mini",
+    "temperature": 0.1,
+    "max_tokens": 4000
+  },
+  "cache": {
+    "enabled": true,
+    "memory_slots": 100,
+    "disk_max_size_mb": 500,
+    "default_ttl_hours": 24,
+    "cleanup_interval_hours": 6
+  },
+  "processing": {
+    "default_schema": "default_schema.json",
+    "default_prompt": "default_prompt",
+    "input_dir": "processed_documents",
+    "output_dir": "processed_documents"
+  },
+  "input_settings": {
+    "default_input_file": "processed_documents/complete_processing_report.md",
+    "max_input_size_mb": 50,
+    "encoding": "utf-8"
+  },
+  "output_settings": {
+    "output_directory": "processed_documents",
+    "filename_template": "structured_results_{timestamp}.json",
+    "pretty_print": true,
+    "backup_originals": true
+  },
+  "logging": {
+    "level": "INFO",
+    "log_api_calls": true,
+    "log_cache_operations": true,
+    "detailed_errors": true,
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  },
+  "cost_estimation": {
+    "gpt-4o-mini": {
+      "input_per_1k_tokens": 0.150,
+      "output_per_1k_tokens": 0.600
+    },
+    "gpt-4o": {
+      "input_per_1k_tokens": 5.0,
+      "output_per_1k_tokens": 15.0
+    },
+    "gpt-4": {
+      "input_per_1k_tokens": 30.0,
+      "output_per_1k_tokens": 60.0
+    }
+  }
+}
