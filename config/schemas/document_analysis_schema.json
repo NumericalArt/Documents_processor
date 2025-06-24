@@ -1,0 +1,117 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "document_analysis_schema.json",
+  "title": "Document Analysis Extraction Schema",
+  "type": "object",
+  "properties": {
+    "metadata": {
+      "$ref": "base_types.json#/definitions/ReportMetadata"
+    },
+    "extraction_info": {
+      "$ref": "base_types.json#/definitions/ExtractionInfo"
+    },
+    "results": {
+      "type": "object",
+      "properties": {
+        "documents": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              {"$ref": "base_types.json#/definitions/BaseEntity"},
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "enum": ["pdf", "image", "spreadsheet", "text", "presentation", "archive", "other"]
+                  },
+                  "file_size_bytes": {
+                    "type": ["integer", "null"],
+                    "minimum": 0
+                  },
+                  "page_count": {
+                    "type": ["integer", "null"],
+                    "minimum": 1
+                  },
+                  "language": {
+                    "type": ["string", "null"],
+                    "pattern": "^[a-z]{2}(-[A-Z]{2})?$"
+                  },
+                  "content_summary": {
+                    "type": ["string", "null"],
+                    "maxLength": 500
+                  },
+                  "key_topics": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "maxItems": 10
+                  },
+                  "contains_personal_data": {
+                    "type": "boolean"
+                  },
+                  "contains_financial_data": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "entities": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              {"$ref": "base_types.json#/definitions/BaseEntity"},
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "enum": ["person", "organization", "location", "date", "monetary_value", "identifier", "other"]
+                  },
+                  "value": {
+                    "type": "string",
+                    "description": "The actual extracted value"
+                  },
+                  "context": {
+                    "type": ["string", "null"],
+                    "description": "Surrounding context where entity was found",
+                    "maxLength": 200
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "contacts": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              {"$ref": "base_types.json#/definitions/BaseEntity"},
+              {"$ref": "base_types.json#/definitions/ContactInfo"},
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "const": "contact"
+                  },
+                  "person_name": {
+                    "type": ["string", "null"]
+                  },
+                  "organization": {
+                    "type": ["string", "null"]
+                  },
+                  "role": {
+                    "type": ["string", "null"]
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "required": ["documents"]
+    }
+  },
+  "required": ["metadata", "results"]
+}
