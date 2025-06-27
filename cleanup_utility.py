@@ -15,21 +15,246 @@ Target Directories:
     - images/             - All processed and extracted images (unified storage)
     - media_for_processing/ - Temporary media files
     - tables/             - Extracted CSV tables from spreadsheets
+    - processing_cache/   - Processing cache files from structured_report_processor
+    - structured_results/ - Previous structured extraction results (selective)
+    - processing_logs/    - Processing log files (keeping latest only)
+
+Programmatic Usage:
+    from cleanup_utility import cleanup_before_batch_processing
+    
+    # Clean before batch processing
+    stats = cleanup_before_batch_processing(
+        target_directories=['images', 'processing_cache'],
+        exclude_protected=True,
+        silent=True
+    )
 """
 
 import os
 import shutil
 import argparse
 import sys
+import glob
+import logging
 from datetime import datetime
 from pathlib import Path
+from typing import List, Dict, Any, Optional
 
 # Target directories for cleanup
 TARGET_DIRECTORIES = {
     'images': 'All processed and extracted images (unified storage)',
     'media_for_processing': 'Temporary media files',
-    'tables': 'Extracted CSV tables from spreadsheets'
+    'tables': 'Extracted CSV tables from spreadsheets',
+    'processing_cache': 'Processing cache files from structured_report_processor',
+    'structured_results': 'Previous structured extraction results (selective)',
+    'processing_logs': 'Processing log files (keeping latest only)'
 }
+
+# Protected files that should never be deleted
+PROTECTED_FILES = {
+    'processed_documents/complete_processing_report.md',  # Main report file
+    'processed_documents/processing.log',  # Current log file
+    'config/settings.json',  # Configuration file
+    'config/prompts/default_prompt.txt',  # Default prompt
+}
+
+# Cleanup patterns for selective cleanup
+CLEANUP_PATTERNS = {
+    'processing_cache': 'processed_documents/processing_cache/**/*',
+    'structured_results': 'processed_documents/structured_results_*.json',
+    'temp_logs': 'processed_documents/processing_*.log',  # Excluding main processing.log
+    'backup_files': '**/cleanup_backup_*',
+}
+
+# Module-level logger
+logger = logging.getLogger(__name__)
+
+def cleanup_before_batch_processing(
+    target_directories: Optional[List[str]] = None,
+    exclude_protected: bool = True,
+    create_backup: bool = False,
+    silent: bool = False
+) -> Dict[str, Any]:
+    """
+    Programmatic cleanup function for integration with batch processing workflows.
+    
+    Args:
+        target_directories: List of directories to clean (None = all standard directories)
+        exclude_protected: Protect important files from deletion
+        create_backup: Create backup before deletion
+        silent: Suppress output (for integration)
+        
+    Returns:
+        Dict with cleanup statistics and results
+    """
+    if not silent:
+        logger.info("Starting programmatic cleanup for batch processing")
+    
+    # Default to standard processing directories if none specified
+    if target_directories is None:
+        target_directories = ['images', 'media_for_processing', 'tables', 'processing_cache']
+    
+    # Initialize statistics
+    stats = {
+        'deleted_files': 0,
+        'deleted_size': 0,
+        'protected_files_found': 0,
+        'errors': [],
+        'backup_created': False,
+        'cleanup_directories': target_directories.copy()
+    }
+    
+    # Create utility instance for internal operations
+    utility = CleanupUtility()
+    
+    try:
+        # Scan directories
+        directory_info = {}
+        for directory in target_directories:
+            if directory in TARGET_DIRECTORIES:
+                # Standard directory cleanup
+                file_count, total_size, files = utility.get_directory_info(directory)
+                directory_info[directory] = {
+                    'description': TARGET_DIRECTORIES[directory],
+                    'file_count': file_count,
+                    'total_size': total_size,
+                    'files': files
+                }
+            elif directory in CLEANUP_PATTERNS:
+                # Pattern-based cleanup
+                files = _get_files_by_pattern(CLEANUP_PATTERNS[directory], exclude_protected)
+                file_count = len(files)
+                total_size = sum(os.path.getsize(f) for f, _ in files if os.path.exists(f))
+                directory_info[directory] = {
+                    'description': f'Pattern-based cleanup: {CLEANUP_PATTERNS[directory]}',
+                    'file_count': file_count,
+                    'total_size': total_size,
+                    'files': files
+                }
+        
+        # Filter protected files if requested
+        if exclude_protected:
+            directory_info = _filter_protected_files(directory_info, stats)
+        
+        # Create backup if requested
+        if create_backup and any(info['file_count'] > 0 for info in directory_info.values()):
+            backup_dir = _create_programmatic_backup(directory_info)
+            if backup_dir:
+                stats['backup_created'] = True
+                stats['backup_directory'] = backup_dir
+                if not silent:
+                    logger.info(f"Backup created: {backup_dir}")
+        
+        # Perform cleanup
+        for directory, info in directory_info.items():
+            files = info.get('files', [])
+            if files:
+                if not silent:
+                    logger.info(f"Cleaning {directory}: {len(files)} files")
+                
+                for filepath, size in files:
+                    try:
+                        if os.path.exists(filepath):
+                            os.remove(filepath)
+                            stats['deleted_files'] += 1
+                            stats['deleted_size'] += size
+                    except Exception as e:
+                        error_msg = f"Failed to delete {filepath}: {e}"
+                        stats['errors'].append(error_msg)
+                        if not silent:
+                            logger.warning(error_msg)
+                
+                # Clean up empty directories
+                if directory in TARGET_DIRECTORIES:
+                    _cleanup_empty_directories(directory)
+        
+        if not silent:
+            logger.info(f"Cleanup complete: {stats['deleted_files']} files deleted ({_format_size(stats['deleted_size'])})")
+            
+    except Exception as e:
+        error_msg = f"Programmatic cleanup failed: {e}"
+        stats['errors'].append(error_msg)
+        if not silent:
+            logger.error(error_msg)
+    
+    return stats
+
+def _get_files_by_pattern(pattern: str, exclude_protected: bool = True) -> List[tuple]:
+    """Get files matching a glob pattern."""
+    files = []
+    for filepath in glob.glob(pattern, recursive=True):
+        if os.path.isfile(filepath):
+            if not exclude_protected or filepath not in PROTECTED_FILES:
+                size = os.path.getsize(filepath)
+                files.append((filepath, size))
+    return files
+
+def _filter_protected_files(directory_info: Dict[str, Any], stats: Dict[str, Any]) -> Dict[str, Any]:
+    """Filter out protected files from cleanup lists."""
+    filtered_info = {}
+    
+    for directory, info in directory_info.items():
+        filtered_files = []
+        for filepath, size in info.get('files', []):
+            if filepath in PROTECTED_FILES:
+                stats['protected_files_found'] += 1
+                logger.debug(f"Protected file skipped: {filepath}")
+            else:
+                filtered_files.append((filepath, size))
+        
+        # Update info with filtered files
+        filtered_info[directory] = info.copy()
+        filtered_info[directory]['files'] = filtered_files
+        filtered_info[directory]['file_count'] = len(filtered_files)
+        filtered_info[directory]['total_size'] = sum(size for _, size in filtered_files)
+    
+    return filtered_info
+
+def _create_programmatic_backup(directory_info: Dict[str, Any]) -> Optional[str]:
+    """Create backup for programmatic cleanup."""
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_dir = f"cleanup_backup_programmatic_{timestamp}"
+        os.makedirs(backup_dir, exist_ok=True)
+        
+        for directory, info in directory_info.items():
+            files = info.get('files', [])
+            if files:
+                backup_subdir = os.path.join(backup_dir, directory.replace('/', '_'))
+                os.makedirs(backup_subdir, exist_ok=True)
+                
+                for filepath, _ in files:
+                    if os.path.exists(filepath):
+                        try:
+                            backup_path = os.path.join(backup_subdir, os.path.basename(filepath))
+                            shutil.copy2(filepath, backup_path)
+                        except Exception as e:
+                            logger.warning(f"Backup failed for {filepath}: {e}")
+        
+        return backup_dir
+    except Exception as e:
+        logger.error(f"Backup creation failed: {e}")
+        return None
+
+def _cleanup_empty_directories(directory: str) -> None:
+    """Remove empty directories after file cleanup."""
+    try:
+        for root, dirs, files in os.walk(directory, topdown=False):
+            if not files and not dirs and root != directory:
+                os.rmdir(root)
+    except Exception as e:
+        logger.debug(f"Empty directory cleanup failed for {directory}: {e}")
+
+def _format_size(size_bytes: int) -> str:
+    """Format file size in human readable format."""
+    if size_bytes == 0:
+        return "0 B"
+    
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size_bytes < 1024.0:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.1f} TB"
 
 class CleanupUtility:
     """Main cleanup utility class for managing temporary file cleanup operations."""
@@ -445,6 +670,32 @@ Target Directories:
   images/              - All processed and extracted images (unified storage)
   media_for_processing/ - Temporary media files  
   tables/              - Extracted CSV tables from spreadsheets
+  processing_cache/    - Processing cache files from structured_report_processor
+  structured_results/  - Previous structured extraction results (selective)
+  processing_logs/     - Processing log files (keeping latest only)
+
+Protected Files (never deleted):
+  processed_documents/complete_processing_report.md - Main processing report
+  processed_documents/processing.log - Current log file
+  config/settings.json - Configuration file
+  config/prompts/default_prompt.txt - Default prompt template
+
+Programmatic Usage:
+  from cleanup_utility import cleanup_before_batch_processing
+  
+  # Standard cleanup before batch processing
+  stats = cleanup_before_batch_processing()
+  
+  # Custom cleanup with specific directories
+  stats = cleanup_before_batch_processing(
+      target_directories=['images', 'processing_cache'],
+      exclude_protected=True,
+      create_backup=False,
+      silent=True
+  )
+  
+  # Check results
+  print(f"Deleted {stats['deleted_files']} files ({stats['deleted_size']} bytes)")
         """
     )
     
