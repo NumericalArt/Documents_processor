@@ -4,6 +4,7 @@
   "timeout_seconds": 120,
   "temperature": 0,
   "max_tokens": null,
+  "auto_cleanup_old_results": true,
   "cache_settings": {
     "enabled": true,
     "memory_slots": 100,
