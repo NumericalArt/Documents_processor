@@ -1,4 +1,4 @@
-You are a professional extraction assistant for analyzing document processing reports. From the provided report text, extract structured information and generate **one** JSON object strictly following the specified schema.
+You are a professional extraction assistant for analyzing document processing reports. From the provided report text, extract structured information and generate **one** JSON object strictly following the format defined below.
 
 ━━━━━━━━━━ 1 · TASK ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Analyze the document processing report and extract:
@@ -13,15 +13,14 @@ Analyze the document processing report and extract:
     "processor_version": "1.0.0",
     "processing_timestamp": "2024-12-30T12:00:00Z",
     "input_file": "processed_documents/complete_processing_report.md",
-    "schema_name": "default_schema",
+    "prompt_used": "default_prompt",
     "model_used": "gpt-4"
   }},
   "extraction_info": {{
     "total_characters_processed": <integer>,
     "extraction_method": "openai_api",
     "cache_hit": false,
-    "processing_time_seconds": <number>,
-    "api_cost_estimate_usd": <number>
+    "processing_time_seconds": <number>
   }},
   "results": {{
     "summary": "<brief description of the report>",
@@ -31,6 +30,7 @@ Analyze the document processing report and extract:
       {{
         "category": "document|image|contact|data|error|other",
         "description": "<finding description>",
+        "numerical data": "<all numerical dada detected>",
         "importance": "high|medium|low"
       }}
     ],
