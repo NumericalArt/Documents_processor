@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Structured Document Processing Report Analyzer
-Extracts structured information from document processing reports
-using configurable JSON schemas and OpenAI API.
+Структурированная обработка отчетов через OpenAI API
+Извлекает структурированную информацию из отчетов обработки документов
+согласно настраиваемым промптам.
 """
 
 import os
@@ -21,16 +21,16 @@ from dataclasses import dataclass, asdict
 from openai import OpenAI
 from dotenv import load_dotenv
 
-# Processor version
+# Версия процессора
 __version__ = "1.0.0"
 
-# Logging setup
+# Настройка логирования
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class CacheConfig:
-    """Caching system configuration"""
+    """Конфигурация системы кеширования"""
     enabled: bool = True
     memory_slots: int = 100
     disk_max_size_mb: int = 500
@@ -40,13 +40,12 @@ class CacheConfig:
 
 @dataclass
 class ProcessingStats:
-    """Processing statistics"""
+    """Статистика обработки"""
     start_time: float
     end_time: Optional[float] = None
     characters_processed: int = 0
     cache_hit: bool = False
     api_calls: int = 0
-    cost_estimate_usd: float = 0.0
     
     @property
     def processing_time_seconds(self) -> float:
@@ -56,63 +55,57 @@ class ProcessingStats:
 
 
 class TieredCacheManager:
-    """Multi-tier cache manager for OpenAI API results"""
+    """Многоуровневый менеджер кеша для OpenAI API результатов"""
     
     def __init__(self, config: CacheConfig, cache_dir: str = "processed_documents/processing_cache"):
         self.config = config
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
-        # Simple in-memory cache (LRU via OrderedDict can be added later)
+        # Простой in-memory кеш
         self.memory_cache = {}
         
         logger.info(f"Initialized cache manager with dir: {self.cache_dir}")
     
     def _generate_cache_key(self, text: str, system_prompt: str, model: str) -> str:
-        """Generate smart cache key"""
-        # Text normalization
+        """Генерация умного ключа кеша"""
         normalized_text = " ".join(text.split())
-        
-        # Hashes for uniqueness
         prompt_hash = hashlib.sha256(system_prompt.encode()).hexdigest()[:8]
         content_hash = hashlib.sha256(normalized_text.encode()).hexdigest()[:16]
-        
         return f"{model}_{prompt_hash}_{content_hash}"
     
     def _get_cache_file_path(self, cache_key: str) -> Path:
-        """Cache file path"""
+        """Путь к файлу кеша"""
         return self.cache_dir / f"{cache_key}.json"
     
     def get(self, text: str, system_prompt: str, model: str) -> Optional[Dict[str, Any]]:
-        """Get from cache"""
+        """Получение из кеша"""
         if not self.config.enabled:
             return None
             
         cache_key = self._generate_cache_key(text, system_prompt, model)
         
-        # 1. Check memory cache
+        # 1. Проверка memory cache
         if cache_key in self.memory_cache:
             logger.debug(f"Cache HIT (memory): {cache_key}")
             return self.memory_cache[cache_key]
         
-        # 2. Check disk cache
+        # 2. Проверка disk cache
         cache_file = self._get_cache_file_path(cache_key)
         if cache_file.exists():
             try:
                 with open(cache_file, 'r', encoding='utf-8') as f:
                     cached_data = json.load(f)
                 
-                # TTL check
+                # Проверка TTL
                 cache_time = datetime.fromisoformat(cached_data.get('timestamp', '2000-01-01'))
                 age_hours = (datetime.now() - cache_time).total_seconds() / 3600
                 
                 if age_hours < self.config.default_ttl_hours:
-                    # Promote to memory cache
                     self.memory_cache[cache_key] = cached_data['data']
                     logger.debug(f"Cache HIT (disk): {cache_key}")
                     return cached_data['data']
                 else:
-                    # Expired cache
                     cache_file.unlink()
                     logger.debug(f"Cache EXPIRED: {cache_key}")
             except Exception as e:
@@ -121,16 +114,16 @@ class TieredCacheManager:
         return None
     
     def set(self, text: str, system_prompt: str, model: str, data: Dict[str, Any]) -> None:
-        """Save to cache"""
+        """Сохранение в кеш"""
         if not self.config.enabled:
             return
             
         cache_key = self._generate_cache_key(text, system_prompt, model)
         
-        # Save to memory cache
+        # Сохранение в memory cache
         self.memory_cache[cache_key] = data
         
-        # Save to disk cache
+        # Сохранение в disk cache
         cache_file = self._get_cache_file_path(cache_key)
         cache_entry = {
             'timestamp': datetime.now().isoformat(),
@@ -147,14 +140,14 @@ class TieredCacheManager:
 
 
 class PromptManager:
-    """System prompts manager"""
+    """Менеджер системных промптов"""
     
     def __init__(self, prompts_dir: str = "config/prompts"):
         self.prompts_dir = Path(prompts_dir)
         self.prompts_cache = {}
     
     def load_prompt(self, prompt_name: str) -> str:
-        """Load prompt from file"""
+        """Загрузка промпта из файла"""
         if prompt_name in self.prompts_cache:
             return self.prompts_cache[prompt_name]
         
@@ -169,186 +162,133 @@ class PromptManager:
         return prompt_content
     
     def list_available_prompts(self) -> List[str]:
-        """List available prompts"""
+        """Список доступных промптов"""
         if not self.prompts_dir.exists():
             return []
         
         return [f.stem for f in self.prompts_dir.glob("*.txt")]
 
 
-class SchemaManager:
-    """JSON schemas manager"""
-    
-    def __init__(self, schemas_dir: str = "config/schemas"):
-        self.schemas_dir = Path(schemas_dir)
-        self.schemas_cache = {}
-    
-    def load_schema(self, schema_name: str) -> Dict[str, Any]:
-        """Load schema from file"""
-        if schema_name in self.schemas_cache:
-            return self.schemas_cache[schema_name]
-        
-        schema_file = self.schemas_dir / schema_name
-        if not schema_file.exists():
-            raise FileNotFoundError(f"Schema file not found: {schema_file}")
-        
-        with open(schema_file, 'r', encoding='utf-8') as f:
-            schema_content = json.load(f)
-        
-        self.schemas_cache[schema_name] = schema_content
-        return schema_content
-    
-    def list_available_schemas(self) -> List[str]:
-        """List available schemas"""
-        if not self.schemas_dir.exists():
-            return []
-        
-        return [f.name for f in self.schemas_dir.glob("*.json")]
-    
-    def get_schema_info(self, schema_name: str) -> Dict[str, Any]:
-        """Get schema metadata and summary"""
-        schema = self.load_schema(schema_name)
-        return {
-            'name': schema_name,
-            'title': schema.get('title', 'Untitled Schema'),
-            'description': schema.get('description', 'No description available'),
-            'version': schema.get('version', '1.0.0'),
-            'properties_count': len(schema.get('properties', {}))
-        }
-
-
 class StructuredReportProcessor:
-    """Main processor class for structured report analysis"""
+    """
+    Основной класс для структурированной обработки отчетов
+    через OpenAI API с кешированием и валидацией
+    """
     
     def __init__(self, config_file: str = "config/settings.json"):
-        # Load environment variables
-        load_dotenv()
-        
-        # Load configuration
+        """Инициализация процессора с конфигурацией"""
         self.config = self._load_config(config_file)
-        
-        # Setup logging
         self._setup_logging()
         
-        # Initialize managers
-        self.cache_manager = TieredCacheManager(CacheConfig(**self.config.get('cache', {})))
-        self.prompt_manager = PromptManager(self.config.get('prompts_dir', 'config/prompts'))
-        self.schema_manager = SchemaManager(self.config.get('schemas_dir', 'config/schemas'))
+        # Инициализация компонентов
+        self.cache_manager = TieredCacheManager(CacheConfig(**self.config["cache_settings"]))
+        self.prompt_manager = PromptManager()
         
-        # Initialize OpenAI client
-        self.client = OpenAI(
-            api_key=os.getenv('OPENAI_API_KEY') or self.config.get('openai_api_key')
-        )
+        # OpenAI клиент
+        load_dotenv()
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY not found in environment variables")
         
-        logger.info(f"StructuredReportProcessor v{__version__} initialized")
+        self.client = OpenAI(api_key=api_key)
+        logger.info(f"Initialized StructuredReportProcessor v{__version__}")
     
     def _load_config(self, config_file: str) -> Dict[str, Any]:
-        """Load configuration from file"""
+        """Загрузка конфигурации"""
         config_path = Path(config_file)
         if config_path.exists():
             with open(config_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
         else:
-            logger.warning(f"Config file not found: {config_file}, using defaults")
+            logger.warning(f"Config file {config_file} not found, using defaults")
             return self._get_default_config()
     
     def _get_default_config(self) -> Dict[str, Any]:
-        """Get default configuration"""
+        """Конфигурация по умолчанию"""
         return {
-            "openai": {
-                "model": "gpt-4o-mini",
-                "temperature": 0.1,
-                "max_tokens": 4000
-            },
-            "cache": {
+            "default_model": "gpt-4.1-mini",
+            "fallback_model": "gpt-4.1-mini",
+            "timeout_seconds": 120,
+            "temperature": 0,
+            "cache_settings": {
                 "enabled": True,
                 "memory_slots": 100,
                 "disk_max_size_mb": 500,
-                "default_ttl_hours": 24
+                "default_ttl_hours": 24,
+                "cleanup_interval_hours": 6
             },
-            "processing": {
-                "default_schema": "default_schema.json",
-                "default_prompt": "default_prompt",
-                "input_dir": "processed_documents",
-                "output_dir": "processed_documents"
+            "input_settings": {
+                "default_input_file": "processed_documents/complete_processing_report.md",
+                "max_input_size_mb": 50,
+                "encoding": "utf-8"
+            },
+            "output_settings": {
+                "output_directory": "processed_documents",
+                "filename_template": "structured_results_{timestamp}.json",
+                "pretty_print": True
             },
             "logging": {
-                "level": "INFO",
-                "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+                "level": "INFO"
             }
         }
     
     def _setup_logging(self):
-        """Setup logging configuration"""
-        log_config = self.config.get('logging', {})
+        """Настройка логирования"""
+        log_level = getattr(logging, self.config["logging"]["level"], logging.INFO)
         logging.basicConfig(
-            level=getattr(logging, log_config.get('level', 'INFO')),
-            format=log_config.get('format', '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            level=log_level,
+            format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
         )
     
-    def _estimate_cost(self, model: str, input_tokens: int, output_tokens: int) -> float:
-        """Estimate API call cost"""
-        # Simplified cost estimation (prices as of 2024)
-        costs = {
-            'gpt-4o-mini': {'input': 0.000150 / 1000, 'output': 0.000600 / 1000},
-            'gpt-4o': {'input': 0.005 / 1000, 'output': 0.015 / 1000},
-            'gpt-4': {'input': 0.03 / 1000, 'output': 0.06 / 1000}
-        }
-        
-        model_cost = costs.get(model, costs['gpt-4o-mini'])
-        return (input_tokens * model_cost['input']) + (output_tokens * model_cost['output'])
-    
     def _call_openai_api(self, text: str, system_prompt: str, model: str) -> Dict[str, Any]:
-        """Make OpenAI API call with error handling"""
+        """Вызов OpenAI API с обработкой ошибок и кешированием"""
+        # Проверка кеша
+        cached_result = self.cache_manager.get(text, system_prompt, model)
+        if cached_result:
+            return cached_result
+        
         try:
-            response = self.client.chat.completions.create(
+            logger.info(f"Calling OpenAI API with model: {model}")
+            resp = self.client.chat.completions.create(
                 model=model,
+                response_format={"type": "json_object"},
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": text}
+                    {"role": "user", "content": text},
                 ],
-                temperature=self.config['openai'].get('temperature', 0.1),
-                max_tokens=self.config['openai'].get('max_tokens', 4000),
-                response_format={"type": "json_object"}
+                temperature=self.config["temperature"],
+                timeout=self.config["timeout_seconds"],
             )
             
-            result = json.loads(response.choices[0].message.content)
+            content = resp.choices[0].message.content
+            result = json.loads(content)
             
-            # Add cost estimation
-            usage = response.usage
-            cost = self._estimate_cost(model, usage.prompt_tokens, usage.completion_tokens)
+            # Сохранение в кеш
+            self.cache_manager.set(text, system_prompt, model, result)
             
-            return {
-                'success': True,
-                'data': result,
-                'tokens_used': usage.total_tokens,
-                'cost_usd': cost
-            }
+            logger.info("Successfully processed OpenAI response")
+            return result
             
         except Exception as e:
-            logger.error(f"OpenAI API error: {e}")
-            return {
-                'success': False,
-                'error': str(e),
-                'data': self._get_fallback_result()
-            }
+            logger.error(f"OpenAI API call failed: {e}")
+            return self._get_fallback_result()
     
     def _get_fallback_result(self) -> Dict[str, Any]:
-        """Generate fallback result when API fails"""
+        """Fallback результат при ошибке API"""
         return {
             "metadata": {
                 "processor_version": __version__,
                 "processing_timestamp": datetime.now(timezone.utc).isoformat(),
                 "input_file": "unknown",
-                "schema_name": "fallback",
+                "prompt_used": "fallback",
                 "model_used": "fallback"
             },
             "extraction_info": {
                 "total_characters_processed": 0,
                 "extraction_method": "fallback",
                 "cache_hit": False,
-                "processing_time_seconds": 0.0,
-                "api_cost_estimate_usd": 0.0
+                "processing_time_seconds": 0
             },
             "results": {
                 "summary": "Processing failed - using fallback result",
@@ -357,232 +297,158 @@ class StructuredReportProcessor:
                 "key_findings": [
                     {
                         "category": "error",
-                        "description": "API processing failed, manual review required",
+                        "description": "OpenAI API call failed",
                         "importance": "high"
                     }
                 ],
-                "processing_errors": [
-                    {
-                        "file_name": "system",
-                        "error_type": "api_failure",
-                        "error_description": "OpenAI API call failed"
-                    }
-                ]
+                "processing_errors": []
             }
         }
     
     def process_report(
         self,
         input_file: str = None,
-        schema_name: str = None,
         prompt_name: str = "default_prompt",
         model: str = None,
         output_file: str = None
     ) -> Dict[str, Any]:
-        """
-        Process a document processing report with structured extraction
-        
-        Args:
-            input_file: Path to input markdown report
-            schema_name: JSON schema file name
-            prompt_name: System prompt name
-            model: OpenAI model to use
-            output_file: Output JSON file path
-            
-        Returns:
-            Dict containing extracted structured information
-        """
+        """Основной метод обработки отчета"""
         stats = ProcessingStats(start_time=time.time())
         
-        # Use defaults from config if not provided
-        if input_file is None:
-            input_file = f"{self.config['processing']['input_dir']}/complete_processing_report.md"
-        if schema_name is None:
-            schema_name = self.config['processing']['default_schema']
-        if model is None:
-            model = self.config['openai']['model']
-        if output_file is None:
-            base_name = Path(input_file).stem
-            output_file = f"{self.config['processing']['output_dir']}/{base_name}_structured.json"
-        
-        logger.info(f"Processing: {input_file} -> {output_file}")
-        logger.info(f"Schema: {schema_name}, Prompt: {prompt_name}, Model: {model}")
-        
         try:
-            # 1. Read input report
+            input_file = input_file or self.config["input_settings"]["default_input_file"]
+            model = model or self.config["default_model"]
+            
+            logger.info(f"Starting processing: {input_file} with prompt: {prompt_name}")
+            
+            # Чтение входного файла
             input_path = Path(input_file)
             if not input_path.exists():
                 raise FileNotFoundError(f"Input file not found: {input_file}")
             
-            with open(input_path, 'r', encoding='utf-8') as f:
-                report_text = f.read()
+            with open(input_path, 'r', encoding=self.config["input_settings"]["encoding"]) as f:
+                text_content = f.read()
             
-            stats.characters_processed = len(report_text)
-            logger.info(f"Read {stats.characters_processed} characters from {input_file}")
+            stats.characters_processed = len(text_content)
             
-            # 2. Load schema and prompt
-            schema = self.schema_manager.load_schema(schema_name)
+            # Загрузка системного промпта
             system_prompt = self.prompt_manager.load_prompt(prompt_name)
             
-            # 3. Check cache
-            cached_result = self.cache_manager.get(report_text, system_prompt, model)
-            if cached_result:
-                logger.info("Using cached result")
-                stats.cache_hit = True
-                result = cached_result
-            else:
-                # 4. Call OpenAI API
-                logger.info("Calling OpenAI API...")
-                api_response = self._call_openai_api(report_text, system_prompt, model)
-                
-                if api_response['success']:
-                    result = api_response['data']
-                    stats.api_calls = 1
-                    stats.cost_estimate_usd = api_response.get('cost_usd', 0.0)
-                    
-                    # Cache the result
-                    self.cache_manager.set(report_text, system_prompt, model, result)
-                else:
-                    logger.error("API call failed, using fallback")
-                    result = api_response['data']
+            # Вызов OpenAI API
+            result = self._call_openai_api(text_content, system_prompt, model)
             
-            # 5. Enhance result with processing metadata
+            # Обновление метаданных в результате
+            if "metadata" in result:
+                result["metadata"].update({
+                    "processor_version": __version__,
+                    "processing_timestamp": datetime.now(timezone.utc).isoformat(),
+                    "input_file": str(input_path),
+                    "prompt_used": prompt_name,
+                    "model_used": model
+                })
+            
+            # Обновление статистики извлечения
             stats.end_time = time.time()
+            if "extraction_info" in result:
+                result["extraction_info"].update({
+                    "total_characters_processed": stats.characters_processed,
+                    "extraction_method": "cached" if stats.cache_hit else "openai_api",
+                    "cache_hit": stats.cache_hit,
+                    "processing_time_seconds": stats.processing_time_seconds
+                })
             
-            if 'metadata' not in result:
-                result['metadata'] = {}
-            if 'extraction_info' not in result:
-                result['extraction_info'] = {}
+            # Сохранение результата
+            if output_file:
+                self._save_results(result, output_file)
+            else:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = self.config["output_settings"]["filename_template"].format(timestamp=timestamp)
+                output_path = Path(self.config["output_settings"]["output_directory"]) / filename
+                self._save_results(result, str(output_path))
             
-            result['metadata'].update({
-                'processor_version': __version__,
-                'processing_timestamp': datetime.now(timezone.utc).isoformat(),
-                'input_file': str(input_file),
-                'schema_name': schema_name,
-                'model_used': model
-            })
-            
-            result['extraction_info'].update({
-                'total_characters_processed': stats.characters_processed,
-                'extraction_method': 'openai_api',
-                'cache_hit': stats.cache_hit,
-                'processing_time_seconds': stats.processing_time_seconds,
-                'api_cost_estimate_usd': stats.cost_estimate_usd
-            })
-            
-            # 6. Save results
-            self._save_results(result, output_file)
-            
-            logger.info(f"Processing completed successfully")
-            logger.info(f"Processing time: {stats.processing_time_seconds:.2f}s")
-            logger.info(f"Cost estimate: ${stats.cost_estimate_usd:.4f}")
-            
+            logger.info(f"Processing completed successfully in {stats.processing_time_seconds:.2f}s")
             return result
             
         except Exception as e:
             logger.error(f"Processing failed: {e}")
-            raise
+            stats.end_time = time.time()
+            return self._get_fallback_result()
     
     def _save_results(self, results: Dict[str, Any], output_file: str) -> None:
-        """Save results to JSON file"""
+        """Сохранение результатов в файл"""
         output_path = Path(output_file)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
         with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
+            if self.config["output_settings"]["pretty_print"]:
+                json.dump(results, f, ensure_ascii=False, indent=2)
+            else:
+                json.dump(results, f, ensure_ascii=False)
         
-        logger.info(f"Results saved to: {output_file}")
-    
-    def list_schemas(self) -> List[str]:
-        """List available schemas"""
-        return self.schema_manager.list_available_schemas()
+        logger.info(f"Results saved to: {output_path}")
     
     def list_prompts(self) -> List[str]:
-        """List available prompts"""
+        """Список доступных промптов"""
         return self.prompt_manager.list_available_prompts()
 
 
 def main():
-    """Command line interface"""
+    """Основная функция CLI"""
     parser = argparse.ArgumentParser(
-        description='Structured Document Processing Report Analyzer',
+        description="Структурированная обработка отчетов через OpenAI API",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  # Process with default settings
-  python structured_report_processor.py
-  
-  # Use specific schema and prompt
-  python structured_report_processor.py -s document_analysis_schema.json -p custom_prompt
-  
-  # Process specific file
-  python structured_report_processor.py -i reports/my_report.md -o results/output.json
-  
-  # List available resources
-  python structured_report_processor.py --list-schemas
-  python structured_report_processor.py --list-prompts
+Примеры использования:
+  %(prog)s                                     # Обработка с настройками по умолчанию
+  %(prog)s --prompt custom_prompt             # Использование конкретного промпта
+  %(prog)s --input custom_report.md           # Обработка конкретного файла
+  %(prog)s --model gpt-3.5-turbo             # Использование другой модели
+  %(prog)s --list-prompts                     # Показать доступные промпты
         """
     )
     
-    parser.add_argument('-i', '--input', 
-                       help='Input markdown report file (default: processed_documents/complete_processing_report.md)')
-    parser.add_argument('-o', '--output',
-                       help='Output JSON file (default: auto-generated based on input name)')
-    parser.add_argument('-s', '--schema',
-                       help='JSON schema file name (default: default_schema.json)')
-    parser.add_argument('-p', '--prompt',
-                       help='System prompt name (default: default_prompt)')
-    parser.add_argument('-m', '--model',
-                       help='OpenAI model (default: gpt-4o-mini)')
-    parser.add_argument('--list-schemas', action='store_true',
-                       help='List available schemas')
-    parser.add_argument('--list-prompts', action='store_true',
-                       help='List available prompts')
-    parser.add_argument('-v', '--verbose', action='store_true',
-                       help='Enable verbose logging')
-    parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
+    parser.add_argument("--input", "-i", help="Входной файл отчета")
+    parser.add_argument("--output", "-o", help="Выходной файл результатов")
+    parser.add_argument("--prompt", "-p", default="default_prompt", help="Системный промпт для использования")
+    parser.add_argument("--model", "-m", help="OpenAI модель для использования")
+    parser.add_argument("--config", "-c", default="config/settings.json", help="Файл конфигурации")
+    
+    # Утилитарные команды
+    parser.add_argument("--list-prompts", action="store_true", help="Показать доступные промпты")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     
     args = parser.parse_args()
     
-    # Setup basic logging for CLI
-    log_level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
-    
     try:
-        processor = StructuredReportProcessor()
+        processor = StructuredReportProcessor(config_file=args.config)
         
-        if args.list_schemas:
-            schemas = processor.list_schemas()
-            print("Available schemas:")
-            for schema in schemas:
-                print(f"  - {schema}")
-            return
-        
+        # Утилитарные команды
         if args.list_prompts:
             prompts = processor.list_prompts()
-            print("Available prompts:")
+            print("Доступные промпты:")
             for prompt in prompts:
                 print(f"  - {prompt}")
             return
         
-        # Process report
+        # Основная обработка
         result = processor.process_report(
             input_file=args.input,
-            schema_name=args.schema,
             prompt_name=args.prompt,
             model=args.model,
             output_file=args.output
         )
         
-        print("✅ Processing completed successfully!")
-        print(f"📄 Results saved to: {args.output or 'auto-generated filename'}")
-        
-        # Show summary
-        if 'results' in result and 'summary' in result['results']:
-            print(f"📋 Summary: {result['results']['summary']}")
+        # Вывод кратких результатов
+        if "results" in result and "summary" in result["results"]:
+            print(f"✅ Обработка завершена: {result['results']['summary']}")
+            
+        if "extraction_info" in result:
+            info = result["extraction_info"]
+            print(f"📊 Статистика: {info.get('total_characters_processed', 0)} символов, "
+                  f"{info.get('processing_time_seconds', 0):.2f}с")
         
     except Exception as e:
-        logger.error(f"CLI execution failed: {e}")
+        logger.error(f"Application error: {e}")
         sys.exit(1)
 
 
