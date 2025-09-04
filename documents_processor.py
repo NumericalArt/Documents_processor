@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 Universal document processor extracting text and images from various formats.
+Now aligned with local 'document_processor_rar_zip.py':
+- Optional direct Excel processing via ENABLE_DIRECT_EXCEL (default: off)
+- Safe Excel utilities for .xlsx/.xls
+- PDF page preview at dpi=200, with unique image filenames
+- AI Vision orientation fix before description
 """
 
 import os
@@ -17,6 +22,7 @@ except ImportError:
 import subprocess
 from datetime import datetime
 from typing import List, Dict, Optional
+from pathlib import Path
 
 import fitz  # PyMuPDF
 import pandas as pd
@@ -27,6 +33,13 @@ import strip_markdown
 import openpyxl
 import pytesseract
 from dotenv import load_dotenv
+
+# Legacy .xls optional support
+try:
+    import xlrd
+    XLRD_AVAILABLE = True
+except ImportError:
+    XLRD_AVAILABLE = False
 
 from openai import OpenAI   # ⬅️ new-style SDK (≥ 1.0.0)  ✅
 
@@ -67,23 +80,24 @@ MAX_IMAGE_SIZE = 10 * 1024 * 1024
 SUPPORTED_IMAGE_FORMATS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".gif", ".tiff", ".tif", ".bmp"}
 
 # ----------------------------------------------------------------------
-# ZIP archive limits
+# ZIP/RAR limits
 # ----------------------------------------------------------------------
 MAX_ZIP_SIZE = 100 * 1024 * 1024        # 100 MB
-MAX_ZIP_FILES = 50                      # process at most 50 files per archive
+MAX_ZIP_FILES = 50
+MAX_RAR_SIZE = 100 * 1024 * 1024
+MAX_RAR_FILES = 50
 
 # ----------------------------------------------------------------------
-# RAR archive limits (same policy as ZIP)
+# Page/sheet limits
 # ----------------------------------------------------------------------
-MAX_RAR_SIZE = 100 * 1024 * 1024      # 100 MB
-MAX_RAR_FILES = 50                    # max members to process
+MAX_PAGES_DEFAULT = 10
+MAX_PAGES_ENV_VAR = "MAX_DOCUMENT_PAGES"
+DISABLE_PAGE_LIMIT_ENV_VAR = "DISABLE_PAGE_LIMIT"
 
 # ----------------------------------------------------------------------
-# Page limit configuration for multi-page documents
+# Excel direct-processing toggle (default: disabled)
 # ----------------------------------------------------------------------
-MAX_PAGES_DEFAULT = 10                                  # default page limit
-MAX_PAGES_ENV_VAR = "MAX_DOCUMENT_PAGES"               # environment variable name
-DISABLE_PAGE_LIMIT_ENV_VAR = "DISABLE_PAGE_LIMIT"      # flag to disable limits
+EXCEL_DIRECT_ENV_VAR = "ENABLE_DIRECT_EXCEL"
 
 ###############################################################################
 # Logging configuration
@@ -105,59 +119,38 @@ logger.addHandler(file_handler)
 def _generate_unique_image_name(source_type: str, original_name: str, extension: str) -> str:
     """
     Generate unique image filename to prevent conflicts across different processing types.
-    
-    Args:
-        source_type: Type of processing (pdf, archive, direct)
-        original_name: Original filename without extension
-        extension: File extension (without dot)
-    
-    Returns:
-        Unique filename in format: {source_type}_{timestamp}_{counter}_{original_name}.{extension}
+    {source_type}_{timestamp}_{counter}_{original_name}.{extension}
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     counter = getattr(_generate_unique_image_name, 'counter', 0) + 1
     _generate_unique_image_name.counter = counter
-    # Clean original name to be filename-safe
     clean_name = "".join(c for c in original_name if c.isalnum() or c in ('_', '-')).rstrip()
     return f"{source_type}_{timestamp}_{counter:03d}_{clean_name}.{extension}"
 
+
 def _ensure_dirs() -> None:
-    """Ensure that standard output directories exist."""
     for d in ("images", "tables", LOG_DIR):
         os.makedirs(d, exist_ok=True)
 
 
 def _save_binary(content: bytes, dest_path: str) -> None:
-    """Write binary data to a destination path, creating parent dirs if needed."""
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     with open(dest_path, "wb") as f:
         f.write(content)
 
-# ----------------------------------------------------------------------
-# Utility to save image data (bytes or fitz.Pixmap or PIL.Image)
-# ----------------------------------------------------------------------
+
 def _save_image_data(data, dest_path: str) -> None:
-    """Save image data (bytes or fitz.Pixmap or PIL.Image) to disk, ensuring parent dirs exist."""
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    # fitz.Pixmap
     if hasattr(data, "save") and callable(data.save):
         data.save(dest_path)
-    # PIL.Image.Image
     elif hasattr(data, "save") and hasattr(data, "format"):
         data.save(dest_path)
     else:
         with open(dest_path, "wb") as f:
             f.write(data)
 
-def _find_soffice() -> str:
-    """
-    Locate LibreOffice 'soffice' executable.
 
-    Order:
-    1. Env variable SOFFICE_PATH
-    2. In PATH (`shutil.which`)
-    3. macOS default location
-    """
+def _find_soffice() -> str:
     candidates = [
         os.getenv("SOFFICE_PATH"),
         shutil.which("soffice"),
@@ -167,210 +160,211 @@ def _find_soffice() -> str:
         if p and os.path.isfile(p):
             return p
     raise FileNotFoundError(
-        "LibreOffice 'soffice' executable not found. "
-        "Install LibreOffice or set env var SOFFICE_PATH."
+        "LibreOffice 'soffice' executable not found. Install LibreOffice or set env var SOFFICE_PATH."
     )
 
 
 def _get_page_limit() -> Optional[int]:
-    """
-    Get page limit configuration from environment variables.
-    
-    Returns:
-        None if page limits are disabled
-        int if page limits are enabled (custom or default)
-        
-    Priority:
-        1. DISABLE_PAGE_LIMIT (if true, return None)
-        2. MAX_DOCUMENT_PAGES (custom limit)
-        3. DEFAULT (10 pages)
-    """
     load_dotenv()
-    
-    # Check if page limits are disabled
     disable_limit = os.getenv(DISABLE_PAGE_LIMIT_ENV_VAR, "").lower()
     if disable_limit in ("true", "1", "yes", "on"):
-        logger.info("Page limits disabled via %s environment variable", DISABLE_PAGE_LIMIT_ENV_VAR)
+        logger.info("Page limits disabled via %s", DISABLE_PAGE_LIMIT_ENV_VAR)
         return None
-    
-    # Check for custom page limit
     custom_limit = os.getenv(MAX_PAGES_ENV_VAR)
     if custom_limit:
         try:
             limit = int(custom_limit)
             if limit > 0:
-                logger.info("Using custom page limit: %d pages (from %s)", limit, MAX_PAGES_ENV_VAR)
+                logger.info("Using custom page limit: %d", limit)
                 return limit
             else:
                 logger.warning("Invalid page limit %s, using default %d", custom_limit, MAX_PAGES_DEFAULT)
         except ValueError:
             logger.warning("Invalid page limit %s, using default %d", custom_limit, MAX_PAGES_DEFAULT)
-    
-    # Use default
-    logger.info("Using default page limit: %d pages", MAX_PAGES_DEFAULT)
+    logger.info("Using default page limit: %d", MAX_PAGES_DEFAULT)
     return MAX_PAGES_DEFAULT
+
+
+def _is_direct_excel_enabled() -> bool:
+    load_dotenv()
+    flag = os.getenv(EXCEL_DIRECT_ENV_VAR, "").lower()
+    return flag in ("true", "1", "yes", "on")
+
+# --------------------------
+# Safe Excel utilities
+# --------------------------
+
+def read_excel_file_safe(file_path: str, sheet_name: Optional[str] = None):
+    file_ext = Path(file_path).suffix.lower()
+    try:
+        if file_ext == ".xlsx":
+            try:
+                return pd.read_excel(file_path, sheet_name=sheet_name, engine="openpyxl")
+            except Exception:
+                return pd.read_excel(file_path, sheet_name=sheet_name)
+        elif file_ext == ".xls":
+            if not XLRD_AVAILABLE:
+                raise ImportError("xlrd library is required for .xls files")
+            workbook = xlrd.open_workbook(file_path)
+            sheet = workbook.sheet_by_index(0) if sheet_name is None else workbook.sheet_by_name(sheet_name)
+            data = []
+            for row_idx in range(sheet.nrows):
+                row_data = [sheet.cell(row_idx, col_idx).value for col_idx in range(sheet.ncols)]
+                data.append(row_data)
+            if data:
+                df = pd.DataFrame(data[1:], columns=data[0]) if len(data) > 1 else pd.DataFrame(data)
+            else:
+                df = pd.DataFrame()
+            return df
+        else:
+            return pd.read_excel(file_path, sheet_name=sheet_name)
+    except Exception as e:
+        logger.error("Error reading Excel file %s: %s", file_path, e)
+        raise
+
+
+def get_excel_sheet_names(file_path: str) -> List[str]:
+    file_ext = Path(file_path).suffix.lower()
+    try:
+        if file_ext == ".xlsx":
+            try:
+                workbook = openpyxl.load_workbook(file_path, read_only=True)
+                return workbook.sheetnames
+            except Exception:
+                with pd.ExcelFile(file_path) as xls:
+                    return xls.sheet_names
+        elif file_ext == ".xls":
+            if not XLRD_AVAILABLE:
+                logger.error("xlrd not available, cannot read .xls files")
+                return []
+            workbook = xlrd.open_workbook(file_path)
+            return workbook.sheet_names()
+        else:
+            with pd.ExcelFile(file_path) as xls:
+                return xls.sheet_names
+    except Exception as e:
+        logger.error("Error getting sheet names from %s: %s", file_path, e)
+        return []
 
 
 ###############################################################################
 # Document class
 ###############################################################################
 class Document:
-    """Universal document processor extracting text / images from many formats."""
-
     _IMAGE_EXTS = SUPPORTED_IMAGE_FORMATS
 
     def __init__(self, file_path: str, *, media_dir: str = "media_for_processing") -> None:
         self.media_dir = media_dir
         os.makedirs(self.media_dir, exist_ok=True)
-
         if not file_path.startswith(self.media_dir):
             self.file_path = os.path.join(self.media_dir, os.path.basename(file_path))
         else:
             self.file_path = file_path
-
         self.file_name = os.path.basename(self.file_path)
         self.file_ext = os.path.splitext(self.file_name)[1].lower()
         self.file_size = os.path.getsize(self.file_path) if os.path.exists(self.file_path) else 0
-
         self.metadata: Dict[str, str] = {}
         self.text_content: str = ""
         self.tables: List[str] = []
         self.images: List[str] = []
 
-    # ---------------------------------------------------------------------
-    # Public API
-    # ---------------------------------------------------------------------
     def process(self) -> None:
-        """Detect file type and dispatch to the correct private handler."""
         if self.file_name.startswith("~$"):
             raise ValueError(f"Temporary file detected ('{self.file_name}'). Skipping processing.")
-
         _ensure_dirs()
-
-        # ─────────────────────────────────────────────────────────────────────
-        # Dispatcher: extensions → methods
-        # ─────────────────────────────────────────────────────────────────────
         HANDLERS = {
-                        ".pdf": self._process_pdf,
-                        ".txt": self._process_txt,
-                        ".pages": self._process_pages,
-                        ".numbers": self._process_numbers,
-                        ".xlsx": self._process_spreadsheet,
-                        ".xls": self._process_spreadsheet,
-                        ".csv": self._process_csv,
-                        ".json": self._process_generic_text,
-                        ".py": self._process_generic_text,
-                        ".html": self._process_generic_text,
-                        ".cms": self._process_generic_text,
-                        ".css": self._process_generic_text,
-                        ".eml": self._process_email,
-                        ".mbox": self._process_email,
-                        ".rtf": self._process_rtf,
-                        ".md": self._process_markdown,
-                        ".markdown": self._process_markdown,
-                        ".odt": self._process_odt,
-                        ".epub": self._process_epub,
-                        ".zip": self._process_generic_zip,
-                        ".rar": self._process_generic_rar,
-            }
-
+            ".pdf": self._process_pdf,
+            ".txt": self._process_txt,
+            ".pages": self._process_pages,
+            ".numbers": self._process_numbers,
+            # spreadsheet handler guarded by env toggle
+            # ".xlsx": self._process_spreadsheet,
+            # ".xls": self._process_spreadsheet,
+            ".csv": self._process_csv,
+            ".json": self._process_generic_text,
+            ".py": self._process_generic_text,
+            ".html": self._process_generic_text,
+            ".cms": self._process_generic_text,
+            ".css": self._process_generic_text,
+            ".eml": self._process_email,
+            ".mbox": self._process_email,
+            ".rtf": self._process_rtf,
+            ".md": self._process_markdown,
+            ".markdown": self._process_markdown,
+            ".odt": self._process_odt,
+            ".epub": self._process_epub,
+            ".zip": self._process_generic_zip,
+            ".rar": self._process_generic_rar,
+        }
         ext = self.file_ext
-
-        # handler selection
-
         if ext in self._IMAGE_EXTS:
             handler = self._process_image
-        elif ext in {".docx", ".doc", ".pptx", ".ppt"}:
-            # first convert Office → PDF
+        elif ext in {".xlsx", ".xls"} and _is_direct_excel_enabled():
+            handler = self._process_spreadsheet
+        elif ext in {".docx", ".doc", ".pptx", ".ppt", ".xls", ".xlsx"}:
             pdf_path = self._convert_to_pdf(self.file_path)
             self.file_path, self.file_name, self.file_ext = pdf_path, os.path.basename(pdf_path), ".pdf"
             handler = self._process_pdf
         else:
             handler = HANDLERS.get(ext)
-
         if not handler:
             raise ValueError(f"Unsupported file format: {ext}")
-        # call the appropriate method
         handler()
 
-
-    # ------------------------------------------------------------------
-    # Format-specific processing methods
-    # ------------------------------------------------------------------
+    # --------------------------
+    # Format-specific methods
+    # --------------------------
 
     def _process_pdf(self) -> None:
-        """
-        Extract text and images from PDF:
-        – text via page.get_text(\"dict\"), as in the "old" version;
-        – saves images, but describes (Vision) only
-          large ones and while not exceeding MAX_VISION_CALLS.
-        """
-
         print(f"Processing PDF document {self.file_path}")
-
         doc = fitz.open(self.file_path)
         self.metadata.update(doc.metadata or {})
         parts: List[str] = []
-
-        # Get page limit configuration
         page_limit = _get_page_limit()
         total_pages = len(doc)
         pages_to_process = min(total_pages, page_limit) if page_limit else total_pages
-        
-        if page_limit and total_pages > page_limit:
-            logger.info("PDF has %d pages, limiting processing to %d pages", total_pages, page_limit)
-
         for page_number in range(pages_to_process):
             page = doc[page_number]
             vision_calls = 0
             image_counter = 1
-
-            # a) if page has vector graphics/background, take preview pixmap
-            if page.get_drawings():
+            page_dict = page.get_text("dict")
+            blocks = page_dict.get("blocks", [])
+            has_text = any(b.get("type") == 0 for b in blocks)
+            has_images = any(b.get("type") == 1 for b in blocks)
+            html_content = page.get_text("html")
+            has_html_images = "<img" in html_content and "base64" in html_content and len(html_content) > 10000
+            if page.get_drawings() or (has_images and not has_text) or has_html_images:
                 print(f"Processing page {page_number + 1} with graphics")
                 try:
-                    pix = page.get_pixmap()
-                    img_path = os.path.join(
-                        "images",
-                        f"{os.path.splitext(self.file_name)[0]}_page{page_number + 1}.png",
-                    )
+                    pix = page.get_pixmap(dpi=200)
+                    unique_name = _generate_unique_image_name("pdf", f"{os.path.splitext(self.file_name)[0]}_page{page_number + 1}", "png")
+                    img_path = os.path.join("images", unique_name)
                     _save_image_data(pix, img_path)
-                    # print(f"Saving page {page_number + 1} image with graphics")
                     self.images.append(img_path)
                     desc = self._generate_image_description(img_path)
-                    # print(f"Processing page {page_number + 1} image with graphics completed")
                     parts.append(f"[========[Page {page_number + 1} with graphics]======== \n {desc}]\n")
                     print(f"Description for page {page_number + 1} with graphics added")
                 except Exception as e:
                     logger.error("Pixmap error p.%s: %s", page_number + 1, e)
                     print(f"Error processing page {page_number + 1} image with graphics")
-
-            else:  # b) regular text + embedded raster images
+            else:
                 print(f"Processing page {page_number + 1}: regular text + embedded raster images")
                 parts.append(f"========[Page {page_number + 1} regular text + embedded raster images]=======\n")
-                page_dict = page.get_text("dict")
-                # print("page_dict:", page_dict)
-                # print("blocks:", page_dict.get("blocks", []))
-                if not page_dict.get("blocks", []):
+                if not blocks:
                     print(f"No text or images found on page {page_number + 1}")
-                for block in page_dict.get("blocks", []):
-                    # print(block.get("type"))
-                    if block.get("type") == 0:  # text block
-                        # print(f"Adding text block for page {page_number + 1}")
+                for block in blocks:
+                    if block.get("type") == 0:
                         for line in block.get("lines", []):
                             for span in line.get("spans", []):
                                 parts.append(span.get("text", ""))
-
-                    elif block.get("type") == 1:  # image block
-                        # print(f"Processing image {image_counter} from page {page_number + 1}")
+                    elif block.get("type") == 1:
                         parts.append(f"========[Image {image_counter}]========\n")
                         img_bytes = block.get("image")
                         w = block.get("width", 0)
                         h = block.get("height", 0)
                         if w * h < MIN_IMG_PIXELS:
-                            continue  # too small — skip
+                            continue
                         img_ext = block.get("ext", "png")
-                        # Generate unique filename for PDF embedded image
                         base_name = f"{os.path.splitext(self.file_name)[0]}_img{image_counter}"
                         unique_name = _generate_unique_image_name("pdf", base_name, img_ext)
                         img_path = os.path.join("images", unique_name)
@@ -383,16 +377,10 @@ class Document:
                             else:
                                 desc = "(description skipped — Vision limit reached)"
                             parts.append(f"[Image {image_counter}: {desc}] (Image saved to: {img_path})")
-                            # print(f"Saving description for image {image_counter} from page {page_number + 1}")
                             image_counter += 1
                         except Exception as e:
                             logger.error("Save/describe image error: %s", e)
-
-                    elif block.get("type") != 0 and block.get("type") != 1:  # other block type
-                        print(f"No text or images found on page {page_number + 1}")
-
             parts.append("\n---\n")
-
         self.text_content = "".join(parts)
         doc.close()
 
@@ -407,74 +395,62 @@ class Document:
             img = Image.open(self.file_path)
         except Exception as e:
             raise ValueError(f"Cannot open image '{self.file_name}': {e}")
-
-        # — auto-rotate image based on EXIF orientation before resizing
         try:
             exif = img.getexif()
-            if exif and exif.get(274):  # 274 is the EXIF Orientation tag
+            if exif and exif.get(274):
                 img = ImageOps.exif_transpose(img)
         except Exception:
             pass
-
         if max(img.size) > MAX_IMAGE_DIM or self.file_size > MAX_IMAGE_SIZE:
             img.thumbnail((MAX_IMAGE_DIM, MAX_IMAGE_DIM))
-
         fmt = "JPEG" if img.format and img.format.lower() in {"tiff", "tif"} else (img.format or "PNG")
-        # Generate unique filename for direct image processing
         base_name = os.path.splitext(self.file_name)[0]
         unique_name = _generate_unique_image_name("direct", base_name, fmt.lower())
         out_path = os.path.join("images", unique_name)
         _save_image_data(img, out_path)
         self.images.append(out_path)
-
         exif_data: Dict[str, str] = {}
         try:
             exif = img.getexif() or {}
             for tag, value in exif.items():
                 exif_data[ExifTags.TAGS.get(tag, tag)] = value
             if "Orientation" in exif_data:
-                # if needed, we can actually rotate the image,
-                # but if just saving — reset the tag
                 exif_data["Orientation"] = 1
             self.metadata.update(exif_data)
         except Exception:
             logger.debug("No EXIF metadata or failed to parse for '%s'", self.file_name)
-
         self.text_content = f"{self._generate_image_description(out_path)} (Image saved to: {out_path})"
 
     def _process_spreadsheet(self) -> None:
         previews: List[str] = []
-        base = os.path.splitext(self.file_name)[0]
-        try:
-            xls = pd.ExcelFile(self.file_path)
-        except Exception as e:
-            raise ValueError(f"Failed to open Excel: {e}")
-
-        # Get page limit configuration (treat each sheet as one "page")
+        sheet_names = get_excel_sheet_names(self.file_path)
+        if not sheet_names:
+            self.text_content = "No readable sheets found"
+            self.metadata['error'] = 'no_sheets'
+            return
         page_limit = _get_page_limit()
-        total_sheets = len(xls.sheet_names)
+        total_sheets = len(sheet_names)
         sheets_to_process = min(total_sheets, page_limit) if page_limit else total_sheets
-        
         if page_limit and total_sheets > page_limit:
             logger.info("Excel has %d sheets, limiting processing to %d sheets", total_sheets, page_limit)
-
-        for sheet_name in xls.sheet_names[:sheets_to_process]:
-            df = pd.read_excel(self.file_path, sheet_name=sheet_name)
-
-            # — full export to CSV
-            csv_path = os.path.join("tables", f"{base}_{sheet_name}.csv")
-            df.to_csv(csv_path, index=False)
-            self.tables.append(csv_path)
-
-            # — full CSV text for report
-            full_csv = df.to_csv(index=False)
-
-            # — Markdown version for readability
-            md = df.to_markdown(index=False)
-
-            previews.append(f"Sheet: {sheet_name} (CSV):\n{full_csv}\n")
-            previews.append(f"Sheet: {sheet_name} (Markdown):\n{md}\n")
-
+            self.metadata['page_limit_reached'] = True
+        base = os.path.splitext(self.file_name)[0]
+        for sheet_name in sheet_names[:sheets_to_process]:
+            try:
+                df = read_excel_file_safe(self.file_path, sheet_name=sheet_name)
+                if df.empty:
+                    continue
+                csv_path = os.path.join("tables", f"{base}_{sheet_name}.csv")
+                os.makedirs("tables", exist_ok=True)
+                df.to_csv(csv_path, index=False)
+                self.tables.append(csv_path)
+                full_csv = df.to_csv(index=False)
+                md = df.to_markdown(index=False)
+                previews.append(f"Sheet: {sheet_name} (CSV):\n{full_csv[:1000]}{'...' if len(full_csv) > 1000 else ''}\n")
+                previews.append(f"Sheet: {sheet_name} (Markdown):\n{md}\n")
+            except Exception as e:
+                logger.error("Error processing sheet %s: %s", sheet_name, e)
+                previews.append(f"Sheet: {sheet_name} (ERROR)\nError: {str(e)}\n")
         self.text_content = "\n".join(previews)
 
     def _process_csv(self) -> None:
@@ -482,17 +458,9 @@ class Document:
         csv_copy = os.path.join("tables", os.path.basename(self.file_path))
         df.to_csv(csv_copy, index=False)
         self.tables.append(csv_copy)
-
-        # — full CSV text
         full_csv = df.to_csv(index=False)
-
-        # — Markdown table for readability
         md = df.to_markdown(index=False)
-
-        self.text_content = (
-            f"CSV (full):\n{full_csv}\n"
-            f"CSV (Markdown):\n{md}"
-        )
+        self.text_content = (f"CSV (full):\n{full_csv}\n" f"CSV (Markdown):\n{md}")
 
     def _process_generic_text(self) -> None:
         with open(self.file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -534,18 +502,17 @@ class Document:
     def _process_numbers(self) -> None:
         self._process_zip_bundle(expect_xml=True)
 
-    # ------------------------------------------------------------------
-    # Helper methods
-    # ------------------------------------------------------------------
+    # --------------------------
+    # Helpers
+    # --------------------------
+
     def _inject_basic_metadata(self) -> None:
         stat = os.stat(self.file_path)
-        self.metadata.update(
-            {
-                "modified_time": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                "created_time": datetime.fromtimestamp(stat.st_ctime).isoformat(),
-                "size_bytes": stat.st_size,
-            }
-        )
+        self.metadata.update({
+            "modified_time": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            "created_time": datetime.fromtimestamp(stat.st_ctime).isoformat(),
+            "size_bytes": stat.st_size,
+        })
 
     def _process_zip_bundle(self, *, expect_xml: bool = False) -> None:
         with zipfile.ZipFile(self.file_path, "r") as z:
@@ -553,9 +520,8 @@ class Document:
             jpg_files = [f for f in z.namelist() if f.endswith((".jpg", ".png"))]
             if jpg_files:
                 data = z.read(jpg_files[0])
-                # Generate unique filename for archive extracted image
                 original_name = os.path.splitext(os.path.basename(jpg_files[0]))[0]
-                extension = os.path.splitext(jpg_files[0])[1][1:]  # Remove the dot
+                extension = os.path.splitext(jpg_files[0])[1][1:]
                 unique_name = _generate_unique_image_name("archive", original_name, extension)
                 img_path = os.path.join("images", unique_name)
                 _save_binary(data, img_path)
@@ -568,195 +534,163 @@ class Document:
                 self.text_content += "(XML not found in bundle)"
         self._inject_basic_metadata()
 
-
     def _convert_to_pdf(self, path: str) -> str:
-        soffice = _find_soffice()       # ← uses new search function
+        soffice = _find_soffice()
         output_dir = os.path.dirname(path)
-        subprocess.run(
-            [soffice, "--headless", "--convert-to", "pdf", "--outdir", output_dir, path],
-            check=True,
-        )
+        subprocess.run([soffice, "--headless", "--convert-to", "pdf", "--outdir", output_dir, path], check=True)
         pdf_path = os.path.splitext(path)[0] + ".pdf"
         logger.debug("Converted '%s' to PDF via %s", path, soffice)
         return pdf_path
 
-    # ------------------------------------------------------------------
-    # OpenAI Vision (updated for SDK ≥1.0.0)
-    # ------------------------------------------------------------------
+    # --------------------------
+    # OpenAI Vision
+    # --------------------------
 
-    def _generate_image_description(
-        self,
-        image_path: str,
-        *,
-        model: str = "gpt-4.1-mini",
-        max_tokens: int = 5000,
-        timeout: float = 120,
-    ) -> str:
+    def _fix_image_orientation(self, b64_string: str, *, model: str = "gpt-4.1", timeout: float = 180) -> str:
         """
-        Generate a short description of an image using GPT-4 Vision.
+        Detect image orientation from base64, rotate in-memory, return new base64.
+        Returns original base64 on error or angle=0.
+        """
+        load_dotenv()
+        api_key = os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            logger.warning("API_KEY not set; skipping image orientation fix.")
+            return b64_string
+        client = OpenAI(api_key=api_key)
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that detects image orientation and responds in JSON."},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "Detect the clockwise rotation (0, 90, 180, 270) needed to make the document upright. Return {\"angle\": <int>}"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_string}"}},
+                    ]},
+                ],
+                max_tokens=100,
+                temperature=0,
+                timeout=timeout,
+            )
+            response_content = completion.choices[0].message.content
+            angle_json = json.loads(response_content)
+            angle = angle_json.get("angle")
+            if angle in {90, 180, 270}:
+                image_data = base64.b64decode(b64_string)
+                img = Image.open(io.BytesIO(image_data))
+                rotated_img = img.rotate(-angle, expand=True)
+                buffered = io.BytesIO()
+                img_format = img.format or "JPEG"
+                rotated_img.save(buffered, format=img_format)
+                return base64.b64encode(buffered.getvalue()).decode()
+            return b64_string
+        except Exception as e:
+            logger.error("OpenAI orientation detection failed: %s", e)
+            return b64_string
 
-        • Uses the new `OpenAI` client (SDK ≥ 1.0.0).
-        • Adds `timeout` so long-running requests don't block the main thread.
-        • In case of error or timeout returns placeholder string.
-        """
+    def _generate_image_description(self, image_path: str, *, model: str = "gpt-4.1-mini", max_tokens: int = 5000, timeout: float = 180) -> str:
         load_dotenv()
         api_key = os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
         if not api_key:
             logger.warning("API_KEY not set; skipping Vision description.")
             return "(description unavailable)"
-
         client = OpenAI(api_key=api_key)
-
         with open(image_path, "rb") as img_file:
             b64 = base64.b64encode(img_file.read()).decode()
-
+        # Correct orientation before sending to description
+        b64 = self._fix_image_orientation(b64_string=b64)
         try:
             completion = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": AI_IMAGE_DESCRIPTION_PROMPT},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                        ],
-                    }
+                    {"role": "user", "content": [
+                        {"type": "text", "text": AI_IMAGE_DESCRIPTION_PROMPT},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                    ]}
                 ],
                 max_tokens=max_tokens,
                 temperature=0,
-                timeout=timeout,          # ← key parameter
+                timeout=timeout,
             )
             return completion.choices[0].message.content.strip()
         except Exception as e:
             logger.error("OpenAI image description failed: %s", e)
             return "(description failed)"
 
-    # Placeholder for email processing
     def _process_email(self) -> None:
         self.text_content = "(email parsing not implemented in this snippet)"
 
-    # ------------------------------------------------------------------
-    # Generic ZIP processing
-    # ------------------------------------------------------------------
+    # --------------------------
+    # Generic ZIP/RAR
+    # --------------------------
+
     def _process_generic_zip(self) -> None:
-        """
-        Handle ordinary .zip archives.
-
-        • Reject archives larger than MAX_ZIP_SIZE.
-        • Iterate through at most MAX_ZIP_FILES entries.
-        • If an entry is a supported image or document type, extract it
-          to a temp sub-folder and recursively process with Document.
-        • Unsupported entries are skipped. If nothing useful found,
-          a placeholder message is stored in text_content.
-        """
         logger.info("Processing ZIP archive '%s' (%d bytes)", self.file_name, self.file_size)
-
         if self.file_size > MAX_ZIP_SIZE:
-            msg = (f"(archive skipped: size {self.file_size} B > "
-                   f"{MAX_ZIP_SIZE} B limit)")
+            msg = (f"(archive skipped: size {self.file_size} B > {MAX_ZIP_SIZE} B limit)")
             logger.warning("%s %s", self.file_name, msg)
             self.text_content = msg
             return
-
-        extracted_root = os.path.join(
-            self.media_dir, "unzipped", os.path.splitext(self.file_name)[0]
-        )
+        extracted_root = os.path.join(self.media_dir, "unzipped", os.path.splitext(self.file_name)[0])
         os.makedirs(extracted_root, exist_ok=True)
-
         useful_files = 0
         try:
             with zipfile.ZipFile(self.file_path, "r") as z:
                 names = z.namelist()
                 if len(names) > MAX_ZIP_FILES:
-                    logger.info("ZIP %s has %d entries; only first %d will be processed",
-                                self.file_name, len(names), MAX_ZIP_FILES)
-
+                    logger.info("ZIP %s has %d entries; only first %d will be processed", self.file_name, len(names), MAX_ZIP_FILES)
                 for idx, name in enumerate(names):
                     if idx >= MAX_ZIP_FILES:
                         break
-                    if name.endswith("/"):            # skip dirs
+                    if name.endswith("/"):
                         continue
                     _, ext = os.path.splitext(name)
                     ext = ext.lower()
-                    if ext in self._IMAGE_EXTS or ext in {
-                        ".pdf", ".txt", ".pages", ".numbers",
-                        ".xlsx", ".xls", ".csv", ".json", ".py",
-                        ".html", ".cms", ".css", ".eml", ".mbox",
-                        ".rtf", ".md", ".markdown", ".odt", ".epub",
-                        ".docx", ".doc", ".pptx", ".ppt"
-                    }:
+                    if ext in self._IMAGE_EXTS or ext in {".pdf", ".txt", ".pages", ".numbers", ".xlsx", ".xls", ".csv", ".json", ".py", ".html", ".cms", ".css", ".eml", ".mbox", ".rtf", ".md", ".markdown", ".odt", ".epub", ".docx", ".doc", ".pptx", ".ppt"}:
                         dest_path = os.path.join(extracted_root, os.path.basename(name))
                         with z.open(name) as src, open(dest_path, "wb") as dst:
                             shutil.copyfileobj(src, dst)
                         logger.info("Extracted %s from %s", name, self.file_name)
-
                         try:
                             child_doc = Document(dest_path, media_dir=self.media_dir)
                             child_doc.process()
                             useful_files += 1
-                            # aggregate outputs
-                            self.text_content += (
-                                f"\n===== [Extracted: {name}] =====\n"
-                                f"{child_doc.text_content}\n"
-                            )
+                            self.text_content += (f"\n===== [Extracted: {name}] =====\n" f"{child_doc.text_content}\n")
                             self.images.extend(child_doc.images)
                             if hasattr(child_doc, "tables"):
                                 self.tables.extend(child_doc.tables)
                         except Exception as e:
-                            logger.error("Failed processing '%s' inside '%s': %s",
-                                         name, self.file_name, e)
+                            logger.error("Failed processing '%s' inside '%s': %s", name, self.file_name, e)
                     else:
                         logger.debug("Skipping unsupported entry '%s' in %s", name, self.file_name)
         except Exception as e:
             logger.error("Cannot open ZIP '%s': %s", self.file_name, e)
             self.text_content = "(zip archive corrupted or unreadable)"
             return
-
         if useful_files == 0:
             self.text_content = "(zip contains no supported documents or images)"
-
         self._inject_basic_metadata()
 
-    # ------------------------------------------------------------------
-    # Generic RAR processing
-    # ------------------------------------------------------------------
     def _process_generic_rar(self) -> None:
-        """
-        Handle ordinary .rar archives similarly to ZIP.
-
-        • Skips if rarfile library is missing.
-        • Rejects archives larger than MAX_RAR_SIZE.
-        • Processes up to MAX_RAR_FILES entries.
-        • Extracts supported documents/images, then recursively processes them.
-        """
         if rarfile is None:
             msg = "(rarfile module not installed; .rar skipped)"
             logger.warning("%s %s", self.file_name, msg)
             self.text_content = msg
             return
-
         logger.info("Processing RAR archive '%s' (%d bytes)", self.file_name, self.file_size)
-
         if self.file_size > MAX_RAR_SIZE:
-            msg = (f"(archive skipped: size {self.file_size} B > "
-                   f"{MAX_RAR_SIZE} B limit)")
+            msg = (f"(archive skipped: size {self.file_size} B > {MAX_RAR_SIZE} B limit)")
             logger.warning("%s %s", self.file_name, msg)
             self.text_content = msg
             return
-
-        extracted_root = os.path.join(
-            self.media_dir, "unrarred", os.path.splitext(self.file_name)[0]
-        )
+        extracted_root = os.path.join(self.media_dir, "unrarred", os.path.splitext(self.file_name)[0])
         os.makedirs(extracted_root, exist_ok=True)
-
         useful_files = 0
         try:
             with rarfile.RarFile(self.file_path) as rf:
                 names = rf.namelist()
                 if len(names) > MAX_RAR_FILES:
-                    logger.info("RAR %s has %d entries; only first %d will be processed",
-                                self.file_name, len(names), MAX_RAR_FILES)
-
+                    logger.info("RAR %s has %d entries; only first %d will be processed", self.file_name, len(names), MAX_RAR_FILES)
                 for idx, name in enumerate(names):
                     if idx >= MAX_RAR_FILES:
                         break
@@ -764,43 +698,31 @@ class Document:
                         continue
                     _, ext = os.path.splitext(name)
                     ext = ext.lower()
-                    if ext in self._IMAGE_EXTS or ext in {
-                        ".pdf", ".txt", ".pages", ".numbers",
-                        ".xlsx", ".xls", ".csv", ".json", ".py",
-                        ".html", ".cms", ".css", ".eml", ".mbox",
-                        ".rtf", ".md", ".markdown", ".odt", ".epub",
-                        ".docx", ".doc", ".pptx", ".ppt"
-                    }:
+                    if ext in self._IMAGE_EXTS or ext in {".pdf", ".txt", ".pages", ".numbers", ".xlsx", ".xls", ".csv", ".json", ".py", ".html", ".cms", ".css", ".eml", ".mbox", ".rtf", ".md", ".markdown", ".odt", ".epub", ".docx", ".doc", ".pptx", ".ppt"}:
                         dest_path = os.path.join(extracted_root, os.path.basename(name))
                         with rf.open(name) as src, open(dest_path, "wb") as dst:
                             shutil.copyfileobj(src, dst)
                         logger.info("Extracted %s from %s", name, self.file_name)
-
                         try:
                             child_doc = Document(dest_path, media_dir=self.media_dir)
                             child_doc.process()
                             useful_files += 1
-                            self.text_content += (
-                                f"\n===== [Extracted: {name}] =====\n"
-                                f"{child_doc.text_content}\n"
-                            )
+                            self.text_content += (f"\n===== [Extracted: {name}] =====\n" f"{child_doc.text_content}\n")
                             self.images.extend(child_doc.images)
                             if hasattr(child_doc, "tables"):
                                 self.tables.extend(child_doc.tables)
                         except Exception as e:
-                            logger.error("Failed processing '%s' inside '%s': %s",
-                                         name, self.file_name, e)
+                            logger.error("Failed processing '%s' inside '%s': %s", name, self.file_name, e)
                     else:
                         logger.debug("Skipping unsupported entry '%s' in %s", name, self.file_name)
         except Exception as e:
             logger.error("Cannot open RAR '%s': %s", self.file_name, e)
             self.text_content = "(rar archive corrupted or unreadable)"
             return
-
         if useful_files == 0:
             self.text_content = "(rar contains no supported documents or images)"
-
         self._inject_basic_metadata()
+
 
 ###############################################################################
 # Batch utility
@@ -810,45 +732,30 @@ def batch_process_folder(
     input_folder: str,
     output_file: str = None,
     *,
-    preview_chars: int = None,   # how many text characters to write to report
-    return_docs: bool = False,   # if True, returns list of dictionaries with results instead of text report
+    preview_chars: int = None,
+    return_docs: bool = False,
 ) -> list:
-    """
-    Traverses *all* files in `input_folder` and nested subfolders.
-    For each file:
-      • creates unique copy in `media_for_processing/<relpath>`
-      • runs Document
-      • writes summary to report
-    """
     _ensure_dirs()
-    # List for returned data of each document
     docs = []  # type: List[dict]
-    # Buffer for text report (if return_docs=False)
     results: List[str] = []
     if not return_docs:
         results.append("=== Batch processing report ===\n")
-
     for root, _, files in os.walk(input_folder):
         for name in sorted(files):
-            if name.startswith("."):            # skip .DS_Store etc.
+            if name.startswith("."):
                 continue
             abs_path = os.path.join(root, name)
             rel_path = os.path.relpath(abs_path, input_folder)
-
-            # ── ensure unique name in media_for_processing ──
             dest_path = os.path.join("media_for_processing", rel_path)
             os.makedirs(os.path.dirname(dest_path), exist_ok=True)
             if not os.path.exists(dest_path):
                 shutil.copy2(abs_path, dest_path)
-
             if not return_docs:
                 results.append("======================================")
                 results.append(f"File: {rel_path}")
-
             try:
                 doc = Document(dest_path)
                 doc.process()
-                # Collect document data
                 doc_info = {
                     'rel_path': rel_path,
                     'file_ext': doc.file_ext,
@@ -856,12 +763,10 @@ def batch_process_folder(
                     'metadata': doc.metadata,
                     'text_content': doc.text_content,
                     'absolute_path': dest_path,
-                    # List of generated CSV files from tables (if any)
                     'tables': getattr(doc, 'tables', []),
                 }
                 docs.append(doc_info)
                 if not return_docs:
-                    # Add to text report
                     results.append(f"Type: {doc.file_ext}")
                     results.append(f"Size: {doc.file_size} bytes")
                     results.append("----------- Metadata -----------")
@@ -872,16 +777,12 @@ def batch_process_folder(
                     else:
                         txt = doc.text_content
                         results.append(txt[:preview_chars] + ("..." if len(txt) > preview_chars else ""))
-
             except Exception as e:
                 results.append(f"ERROR: {e}")
-
             if not return_docs:
                 results.append("======================================\n")
-
     if return_docs:
         return docs
-    # Otherwise — save text report to file
     if output_file:
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
         with open(output_file, "w", encoding="utf-8") as f:
@@ -895,14 +796,3 @@ if __name__ == "__main__":
         "downloaded_files",
         os.path.join("processed_documents_21_04", "final_output_21_04_94.txt"),
     )
-
-# ----------------------------------------------------------------------
-# Manual test instructions:
-# 1. Create a folder 'test_input' with sample files: PDF, images, .xlsx, .txt.
-# 2. Run `batch_process_folder("test_input", "test_report.txt")`.
-# 3. Verify outputs:
-#    - 'processed_documents' contains .txt reports
-#    - 'images' contains saved images for pages and embedded graphics
-#    - 'tables' contains CSV exports from spreadsheets
-# 4. Inspect logs at processed_documents/processing.log for any errors.
-# ----------------------------------------------------------------------

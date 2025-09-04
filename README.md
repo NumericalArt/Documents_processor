@@ -39,13 +39,10 @@ A comprehensive Python utility for processing and extracting content from variou
 ### Basic Installation
 
 ```bash
-# Install all dependencies (includes AI and development tools)
 pip install -r requirements.txt
-
-# Install system dependencies (macOS with Homebrew)
+# macOS
 brew install --cask libreoffice
-
-# Install system dependencies (Ubuntu/Debian)
+# Ubuntu/Debian
 sudo apt install libreoffice
 ```
 
@@ -54,13 +51,12 @@ sudo apt install libreoffice
 ```python
 from documents_processor import Document
 
-# Process a single document with AI image descriptions
 doc = Document("path/to/your/document.pdf")
 doc.process()
 
 print("Extracted text:", doc.text_content)
-print("Found images:", doc.images)  # Saved to images/ with unique names
-print("Extracted tables:", doc.tables)  # Saved to tables/ as CSV files
+print("Found images:", doc.images)
+print("Extracted tables:", doc.tables)
 ```
 
 ### Mass Processing for RAG Systems
@@ -68,37 +64,10 @@ print("Extracted tables:", doc.tables)  # Saved to tables/ as CSV files
 ```python
 from documents_processor import batch_process_folder
 
-# Process entire document collection for RAG system
 results = batch_process_folder(
     input_folder="documents/",
-    output_file="knowledge_base.md"  # Structured for LLM processing
+    output_file="knowledge_base.md"
 )
-```
-
-### Structured Report Processing
-
-```python
-# Process reports with AI-powered structured extraction
-python structured_report_processor.py
-
-# Use custom prompts for specific data extraction
-python structured_report_processor.py --prompt analysis_prompt
-
-# Process specific report file
-python structured_report_processor.py --input my_report.md --output results.json
-```
-
-### Professional Cleanup Management
-
-```bash
-# Interactive cleanup with safety features
-python cleanup_utility.py
-
-# Preview what would be cleaned
-python cleanup_utility.py --preview
-
-# Automatic cleanup with backup
-python cleanup_utility.py --all --backup
 ```
 
 ## 📋 Supported Formats
@@ -106,11 +75,10 @@ python cleanup_utility.py --all --backup
 | Category | Formats | Capabilities | Requirements |
 |----------|---------|-------------|--------------|
 | **Documents** | PDF, DOCX, DOC, RTF, TXT, MD, ODT, EPUB | Text + embedded images + tables | Core installation |
-| **Spreadsheets** | XLSX, XLS, CSV | Data extraction + table export | Core installation |
+| **Spreadsheets** | XLSX, XLS, CSV | Data extraction + table export | Core installation (optional `xlrd` for .xls) |
 | **Presentations** | PPTX, PPT | Text + images + slide structure | LibreOffice |
 | **Images** | JPG, PNG, HEIC, HEIF, GIF, TIFF, BMP | AI descriptions + EXIF metadata | Core installation |
 | **Archives** | ZIP, RAR | Recursive processing + image extraction | Optional: rarfile + unrar |
-| **Special** | Pages, Numbers | Native Apple format support | macOS only |
 
 ## 🔧 Configuration
 
@@ -124,74 +92,29 @@ OPENAI_API_KEY=your_api_key_here
 MAX_DOCUMENT_PAGES=10
 DISABLE_PAGE_LIMIT=false
 
-# Vision API Configuration  
+# Optional: Direct Excel processing (default: off)
+# If disabled, .xls/.xlsx are converted to PDF and processed as PDF
+ENABLE_DIRECT_EXCEL=false
+
+# Vision API Configuration
 MAX_VISION_CALLS_PER_PAGE=50
 ```
 
-## 📚 Documentation
-
-- **[Installation Guide](docs/INSTALLATION.md)** - Comprehensive setup for all platforms
-- **[Cleanup Utility Guide](docs/CLEANUP_UTILITY_GUIDE.md)** - Professional file management
-- **[Structured Processing Guide](docs/STRUCTURED_PROCESSING_GUIDE.md)** - AI-powered report analysis
-- **[API Documentation](docs/API.md)** - Complete API reference and examples
-- **[Usage Examples](docs/EXAMPLES.md)** - Practical examples and tutorials
-
-## 📚 Development History
-
-### Recently Completed Tasks
-- **[Tesseract & setup.py Removal (Dec 2024)](docs/archive/tesseract-removal-archive-2024-12-30.md)** - Eliminated unused dependencies and simplified project architecture
-
-For detailed technical reflection, see [reflection.md](reflection.md).
+### Notes
+- When `ENABLE_DIRECT_EXCEL=true`, each sheet is exported to `tables/*.csv`, with previews added to the text output. Limits are controlled by `MAX_DOCUMENT_PAGES`/`DISABLE_PAGE_LIMIT`.
+- PDF pages that are graphics or scans are saved at `dpi=200` for better detail.
+- Images are saved with unique filenames across PDF, archive, and direct processing.
+- Before AI description, image orientation is auto-detected and corrected in-memory.
 
 ## 🛠️ System Requirements
-
-- **Python**: 3.7 or higher
-- **Optional**: LibreOffice (for advanced document conversion)
-- **Optional**: OpenAI API key (for AI image descriptions)
-- **Optional**: unrar or bsdtar (for RAR archive support)
-
-## 📊 Output Structure
-
-The processor creates organized output directories:
-
-```
-your_project/
-├── processed_documents/    # Processing reports and logs
-├── images/                # All images (unified storage with unique names)
-├── tables/               # Exported tables (CSV format with references)
-└── media_for_processing/ # Temporary processing files
-```
-
-## 🤖 AI-Powered Features
-
-When configured with an OpenAI API key:
-
-- **🔍 Intelligent Image Analysis**: Automatic recognition and description of embedded graphics
-- **📊 Chart & Graph Analysis**: Analysis of charts, graphs, and diagrams with context
-- **📋 Document Structure Recognition**: Understanding of document layout and content hierarchy
-- **🎯 Context-Aware Descriptions**: Image summaries that understand document context
-- **⚙️ Multiple Model Support**: Compatible with various OpenAI Vision models
-
-## 🔒 Privacy & Security
-
-- **🏠 Local-First Processing**: All document processing happens locally on your machine
-- **🔐 Optional AI**: AI features require explicit API key configuration and are fully optional
-- **📝 Data Control**: You maintain complete control over documents and processing results
-- **🚫 No Data Retention**: Documents are not stored or transmitted unless you configure AI features
-- **🛡️ Secure Configuration**: API keys stored in local .env files only
+- Python 3.8+
+- LibreOffice for Office→PDF conversion
+- Optional: `rarfile` + `unrar`/`bsdtar` for RAR archives
+- Optional: `xlrd` for legacy `.xls` files
 
 ## 📈 Performance & Scalability
-
-- **⚡ Memory Efficient**: Stream processing without loading entire files into memory
-- **📊 Configurable Limits**: Fine-grained control over resource usage and processing scope
-- **🔄 Batch Optimization**: Efficient processing of large document collections
-- **📋 Progress Tracking**: Real-time monitoring of processing status for large batches
-- **🎯 Selective Processing**: Process only specific file types or content areas as needed
+- Configurable limits via env vars
+- Unified image/table output folders for downstream processing
 
 ## 🤝 Contributing
-
-We welcome contributions! Please see our contributing guidelines and feel free to submit issues and pull requests.
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+PRs welcome.
