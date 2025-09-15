@@ -1,0 +1,75 @@
+# Documents Processor - Comprehensive Requirements
+# All dependencies for core functionality, AI features, and development tools
+
+# ======================================================================
+# CORE DOCUMENT PROCESSING DEPENDENCIES
+# ======================================================================
+
+# PDF processing
+PyMuPDF>=1.23.0
+
+# Data manipulation and analysis
+pandas>=1.5.0
+
+# Image processing and manipulation
+Pillow>=9.0.0
+
+# RTF document processing
+striprtf>=0.0.26
+
+# Markdown processing
+strip-markdown>=0.1.1
+
+# Excel and spreadsheet processing
+openpyxl>=3.1.0
+
+# Legacy Excel (.xls) file support
+xlrd>=2.0.0
+
+# Pandas performance optimization
+bottleneck>=1.3.6
+
+# Table formatting (required for pandas to_markdown)
+tabulate>=0.9.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# ======================================================================
+# AI-POWERED FEATURES (OPTIONAL)
+# ======================================================================
+
+# AI-powered image descriptions (requires OpenAI API key)
+openai>=1.0.0
+
+# ======================================================================
+# ARCHIVE PROCESSING (OPTIONAL)
+# ======================================================================
+
+# RAR archive support (also requires unrar or bsdtar system tools)
+rarfile>=4.0
+
+# ======================================================================
+# DEVELOPMENT AND TESTING TOOLS
+# ======================================================================
+
+# Testing framework
+pytest>=7.0.0
+
+# Testing with coverage
+pytest-cov>=4.0.0
+
+# Code formatting
+black>=23.0.0
+
+# Code linting
+flake8>=6.0.0
+
+# Type checking
+mypy>=1.0.0
+
+# Documentation generation
+sphinx>=5.0.0
+
+# Development utilities
+pre-commit>=3.0.0
