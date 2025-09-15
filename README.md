@@ -1,3 +1,16 @@
+
+## Versions
+- v2 (default): safer archive handling, env-configured vision models, optional Numbers support.
+- v1 (legacy): preserved under legacy/.
+
+## Configuration (.env)
+See .env.example for required variables. Do not commit real secrets.
+
+## Migration Notes
+- Install LibreOffice (for Office->PDF conversion).
+- Optional: install unrar/bsdtar for .rar support.
+- Optional: pip install numbers-parser for Apple Numbers support.
+
 # Documents Processor 📄🔍
 
 A comprehensive Python utility for processing and extracting content from various document formats with AI-powered image analysis capabilities.
