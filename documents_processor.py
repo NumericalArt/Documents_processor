@@ -24,6 +24,14 @@ from datetime import datetime
 from typing import List, Dict, Optional
 from pathlib import Path
 import json
+import email
+from email import policy
+from email.parser import BytesParser
+# Optional HTML->text conversion
+try:
+    from bs4 import BeautifulSoup  # type: ignore
+except Exception:
+    BeautifulSoup = None  # type: ignore
 
 import fitz  # PyMuPDF
 import pandas as pd
@@ -138,8 +146,9 @@ logger.addHandler(file_handler)
 # Vision models
 ##############################################################################
 
+load_dotenv()
 DOCS_VISION_MODEL = os.getenv("DOCS_VISION_MODEL")
-DOCS_VISION_MODEL_ROTATE = os.getenv("DOCS_VISION_MODEL_ROTATE")  
+DOCS_VISION_MODEL_ROTATE = os.getenv("DOCS_VISION_MODEL_ROTATE")
 
 ###############################################################################
 # Helper utilities
@@ -148,6 +157,39 @@ DOCS_VISION_MODEL_ROTATE = os.getenv("DOCS_VISION_MODEL_ROTATE")
 
 def _safe_name(s: str) -> str:
     return "".join(c for c in s if c.isalnum() or c in ("_", "-"))
+
+
+def _decode_mime_words(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    try:
+        from email.header import decode_header
+        parts = []
+        for bytes_or_str, charset in decode_header(value):
+            if isinstance(bytes_or_str, bytes):
+                try:
+                    parts.append(bytes_or_str.decode(charset or "utf-8", errors="ignore"))
+                except Exception:
+                    parts.append(bytes_or_str.decode("utf-8", errors="ignore"))
+            else:
+                parts.append(bytes_or_str)
+        return "".join(parts).strip()
+    except Exception:
+        return str(value)
+
+
+def _html_to_text(html: str) -> str:
+    try:
+        if BeautifulSoup is not None:
+            soup = BeautifulSoup(html, "html.parser")
+            return (soup.get_text("\n") or "").strip()
+    except Exception:
+        pass
+    # Fallback: naive strip tags
+    import re
+    text = re.sub(r"<\s*br\s*/?\s*>", "\n", html, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    return text.strip()
 
 
 def _generate_unique_image_name(source_type: str, original_name: str, extension: str) -> str:
@@ -347,6 +389,13 @@ class Document:
             self.file_path = file_path
         self.file_name = os.path.basename(self.file_path)
         self.file_ext = os.path.splitext(self.file_name)[1].lower()
+        # Normalize extension to strip trailing non-alnum chars like '}.eml' case
+        if self.file_ext and not self.file_ext[-1].isalnum():
+            # remove trailing non-alnum characters
+            i = len(self.file_ext) - 1
+            while i >= 0 and not self.file_ext[i].isalnum():
+                i -= 1
+            self.file_ext = self.file_ext[:i+1]
         self.file_size = os.path.getsize(self.file_path) if os.path.exists(self.file_path) else 0
         self.metadata: Dict[str, str] = {}
         self.text_content: str = ""
@@ -809,7 +858,113 @@ class Document:
             return "(description failed)"
 
     def _process_email(self) -> None:
-        self.text_content = "(email parsing not implemented in this snippet)"
+        # Parse .eml, extract headers/body, save attachments and process them
+        headers_out: List[str] = []
+        body_text: str = ""
+        attachments_info: List[str] = []
+        attachments_processed = 0
+        try:
+            with open(self.file_path, "rb") as f:
+                msg = BytesParser(policy=policy.default).parse(f)
+        except Exception as e:
+            self.text_content = f"(failed to parse email: {e})"
+            self.metadata['error'] = 'email_parse_failed'
+            return
+
+        # Headers
+        hdr_map = {
+            "From": _decode_mime_words(msg.get("From")),
+            "To": _decode_mime_words(msg.get("To")),
+            "Cc": _decode_mime_words(msg.get("Cc")),
+            "Bcc": _decode_mime_words(msg.get("Bcc")),
+            "Date": _decode_mime_words(msg.get("Date")),
+            "Subject": _decode_mime_words(msg.get("Subject")),
+            "Message-ID": _decode_mime_words(msg.get("Message-ID")),
+        }
+        for k, v in hdr_map.items():
+            if v:
+                headers_out.append(f"{k}: {v}")
+
+        # Walk parts to find body and attachments
+        plain_found = False
+        html_candidate = None
+        attachments_dir = os.path.join(self.media_dir, "attachments", _safe_name(os.path.splitext(self.file_name)[0]))
+        os.makedirs(attachments_dir, exist_ok=True)
+
+        if msg.is_multipart():
+            for part in msg.walk():
+                ctype = part.get_content_type()
+                disp = (part.get_content_disposition() or "").lower()
+                filename = part.get_filename()
+                if filename:
+                    filename = _decode_mime_words(filename)
+                if disp in {"attachment", "inline"} and filename:
+                    try:
+                        data = part.get_payload(decode=True) or b""
+                        safe_base = _safe_name(os.path.splitext(filename)[0]) or "attachment"
+                        ext = os.path.splitext(filename)[1] or ""
+                        dest = os.path.join(attachments_dir, f"{safe_base}{ext}")
+                        dest = _ensure_unique_path(dest)
+                        with open(dest, "wb") as out:
+                            out.write(data)
+                        attachments_processed += 1
+                        attachments_info.append(f"Saved attachment: {os.path.basename(dest)}")
+                        # Process attachment with Document
+                        try:
+                            child_doc = Document(dest, media_dir=self.media_dir)
+                            child_doc.process()
+                            self.images.extend(child_doc.images)
+                            if hasattr(child_doc, 'tables'):
+                                self.tables.extend(child_doc.tables)
+                            attachments_info.append(f"Attachment processed: {os.path.basename(dest)}")
+                            # Append a short preview of child content
+                            preview = child_doc.text_content[:500]
+                            body_text += f"\n---\n[Attachment content preview: {os.path.basename(dest)}]\n{preview}\n"
+                        except Exception as ce:
+                            attachments_info.append(f"Attachment processing failed: {os.path.basename(dest)} ({ce})")
+                    except Exception as se:
+                        attachments_info.append(f"Attachment save failed: {filename} ({se})")
+                    continue
+                # Body parts
+                if ctype == "text/plain" and not plain_found:
+                    try:
+                        body_text = part.get_content() or ""
+                        plain_found = True
+                    except Exception:
+                        pass
+                elif ctype == "text/html" and not plain_found and html_candidate is None:
+                    try:
+                        html_candidate = part.get_content() or ""
+                    except Exception:
+                        pass
+        else:
+            # Singlepart
+            ctype = msg.get_content_type()
+            try:
+                if ctype == "text/plain":
+                    body_text = msg.get_content() or ""
+                    plain_found = True
+                elif ctype == "text/html":
+                    html_candidate = msg.get_content() or ""
+            except Exception:
+                pass
+
+        if not plain_found and html_candidate:
+            body_text = _html_to_text(html_candidate)
+
+        # Assemble text_content
+        lines: List[str] = []
+        lines.append("==== Email Headers ====")
+        lines.extend(headers_out)
+        lines.append("\n==== Email Body ====")
+        lines.append(body_text or "(no body)")
+        if attachments_info:
+            lines.append("\n==== Attachments ====")
+            lines.extend(attachments_info)
+        self.text_content = "\n".join(lines)
+        if attachments_processed:
+            self.metadata['attachments_count'] = attachments_processed
+        self._inject_basic_metadata()
 
     # --------------------------
     # Generic ZIP/RAR
