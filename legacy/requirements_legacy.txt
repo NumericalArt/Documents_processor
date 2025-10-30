@@ -73,6 +73,3 @@ sphinx>=5.0.0
 
 # Development utilities
 pre-commit>=3.0.0
-
-# Apple Numbers support (optional)
-numbers-parser>=3.0.0
