@@ -31,6 +31,7 @@ Programmatic Usage:
 """
 
 import os
+import time
 import shutil
 import argparse
 import sys
@@ -91,8 +92,9 @@ def cleanup_before_batch_processing(
         logger.info("Starting programmatic cleanup for batch processing")
     
     # Default to standard processing directories if none specified
+    # Include processing_logs to prune rotated logs automatically
     if target_directories is None:
-        target_directories = ['images', 'media_for_processing', 'tables', 'processing_cache']
+        target_directories = ['images', 'media_for_processing', 'tables', 'processing_cache', 'processing_logs']
     
     # Initialize statistics
     stats = {
@@ -108,6 +110,9 @@ def cleanup_before_batch_processing(
     utility = CleanupUtility()
     
     try:
+        # Apply retention (logs, reports) and rotate processing.log if oversized
+        _apply_retention_policies(stats, silent=silent)
+        
         # Scan directories
         directory_info = {}
         for directory in target_directories:
@@ -178,6 +183,142 @@ def cleanup_before_batch_processing(
             logger.error(error_msg)
     
     return stats
+
+
+def _apply_retention_policies(stats: Dict[str, Any], *, silent: bool = False) -> None:
+    """Apply retention rules for monitor logs, pipeline/attach reports and rotate processing.log.
+
+    Env variables (optional):
+    - MONITOR_LOG_RETENTION_DAYS (default 7)
+    - MONITOR_LOG_MAX_FILES (default 20)
+    - PROC_LOG_MAX_SIZE_MB (default 20)
+    - PROC_LOG_MAX_ROTATED (default 5)
+    - ATTACH_REPORT_RETENTION_DAYS (default 14)
+    - ATTACH_REPORT_MAX_FILES (default 200)
+    - PIPELINE_REPORT_RETENTION_DAYS (default 14)
+    - PIPELINE_REPORT_MAX_FILES (default 200)
+    """
+    try:
+        monitor_keep_days = int(os.getenv('MONITOR_LOG_RETENTION_DAYS', '7') or '7')
+        monitor_max_files = int(os.getenv('MONITOR_LOG_MAX_FILES', '20') or '20')
+        proc_log_max_mb = int(os.getenv('PROC_LOG_MAX_SIZE_MB', '20') or '20')
+        proc_log_max_rotated = int(os.getenv('PROC_LOG_MAX_ROTATED', '5') or '5')
+        attach_keep_days = int(os.getenv('ATTACH_REPORT_RETENTION_DAYS', '14') or '14')
+        attach_max_files = int(os.getenv('ATTACH_REPORT_MAX_FILES', '200') or '200')
+        pipe_keep_days = int(os.getenv('PIPELINE_REPORT_RETENTION_DAYS', '14') or '14')
+        pipe_max_files = int(os.getenv('PIPELINE_REPORT_MAX_FILES', '200') or '200')
+
+        now = time.time()
+        deleted_files = 0
+        deleted_size = 0
+
+        # 1) Rotate processed_documents/processing.log if too big
+        proc_log_path = os.path.join('processed_documents', 'processing.log')
+        if os.path.exists(proc_log_path):
+            try:
+                size = os.path.getsize(proc_log_path)
+                if size > proc_log_max_mb * 1024 * 1024:
+                    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    rotated = os.path.join('processed_documents', f'processing_{ts}.log')
+                    try:
+                        os.rename(proc_log_path, rotated)
+                        # create new empty
+                        open(proc_log_path, 'w').close()
+                        if not silent:
+                            logger.info(f"Rotated processing.log to {rotated}")
+                    except Exception as e:
+                        logger.warning(f"Failed to rotate processing.log: {e}")
+                    # Prune old rotated logs beyond PROC_LOG_MAX_ROTATED
+                    rotated_list = sorted(glob.glob(os.path.join('processed_documents', 'processing_*.log')), key=lambda p: os.path.getmtime(p), reverse=True)
+                    for old in rotated_list[proc_log_max_rotated:]:
+                        try:
+                            deleted_size += os.path.getsize(old) if os.path.exists(old) else 0
+                            os.remove(old)
+                            deleted_files += 1
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        # 2) Purge monitor logs by retention
+        mon_logs = sorted(glob.glob(os.path.join('logs', 'monitor_*.log')), key=lambda p: os.path.getmtime(p), reverse=True)
+        # Age-based deletion
+        for p in list(mon_logs):
+            try:
+                if now - os.path.getmtime(p) > monitor_keep_days * 86400:
+                    deleted_size += os.path.getsize(p)
+                    os.remove(p)
+                    deleted_files += 1
+            except Exception:
+                pass
+        # Count-based deletion (after age purge)
+        mon_logs = sorted(glob.glob(os.path.join('logs', 'monitor_*.log')), key=lambda p: os.path.getmtime(p), reverse=True)
+        for p in mon_logs[monitor_max_files:]:
+            try:
+                deleted_size += os.path.getsize(p)
+                os.remove(p)
+                deleted_files += 1
+            except Exception:
+                pass
+
+        # 3) Purge attach_reports
+        _purge_dir_by_policy(
+            dir_path=os.path.join('processed_documents', 'attach_reports'),
+            pattern='*.json',
+            max_files=attach_max_files,
+            keep_days=attach_keep_days,
+            now=now,
+            stats=stats,
+        )
+
+        # 4) Purge pipeline_reports
+        _purge_dir_by_policy(
+            dir_path=os.path.join('processed_documents', 'pipeline_reports'),
+            pattern='*.json',
+            max_files=pipe_max_files,
+            keep_days=pipe_keep_days,
+            now=now,
+            stats=stats,
+        )
+
+        # Accumulate deletions from steps 1-2
+        stats['deleted_files'] = stats.get('deleted_files', 0) + deleted_files
+        stats['deleted_size'] = stats.get('deleted_size', 0) + deleted_size
+    except Exception as e:
+        if not silent:
+            logger.warning(f"Retention policies failed: {e}")
+
+
+def _purge_dir_by_policy(dir_path: str, pattern: str, *, max_files: int, keep_days: int, now: float, stats: Dict[str, Any]) -> None:
+    try:
+        if not os.path.isdir(dir_path):
+            return
+        files = sorted(glob.glob(os.path.join(dir_path, pattern)), key=lambda p: os.path.getmtime(p), reverse=True)
+        deleted_files = 0
+        deleted_size = 0
+        # Age-based purge
+        for p in list(files):
+            try:
+                if now - os.path.getmtime(p) > keep_days * 86400:
+                    deleted_size += os.path.getsize(p)
+                    os.remove(p)
+                    deleted_files += 1
+            except Exception:
+                pass
+        # Re-scan after age purge
+        files = sorted(glob.glob(os.path.join(dir_path, pattern)), key=lambda p: os.path.getmtime(p), reverse=True)
+        # Count-based purge
+        for p in files[max_files:]:
+            try:
+                deleted_size += os.path.getsize(p)
+                os.remove(p)
+                deleted_files += 1
+            except Exception:
+                pass
+        stats['deleted_files'] = stats.get('deleted_files', 0) + deleted_files
+        stats['deleted_size'] = stats.get('deleted_size', 0) + deleted_size
+    except Exception:
+        pass
 
 def _get_files_by_pattern(pattern: str, exclude_protected: bool = True) -> List[tuple]:
     """Get files matching a glob pattern."""
