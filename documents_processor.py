@@ -52,6 +52,33 @@ except ImportError:
 
 from openai import OpenAI   # ⬅️ new-style SDK (≥ 1.0.0)  ✅
 
+class LLMConfig:
+    """Small standalone adapter for chat-completion calls."""
+
+    def __init__(self, model: Optional[str] = None) -> None:
+        self.model = model or DOCS_VISION_MODEL
+
+    def get_completion(
+        self,
+        *,
+        messages,
+        max_tokens: int = 1000,
+        temperature: Optional[float] = 0,
+        timeout: Optional[float] = None,
+    ) -> str:
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        client = OpenAI(api_key=_get_api_key())
+        completion = client.chat.completions.create(**kwargs)
+        return completion.choices[0].message.content or ""
+
 # Optional dependency for Apple Numbers (.numbers)
 try:
     from numbers_parser import Document as NumbersDocument  # type: ignore
@@ -81,10 +108,12 @@ AI_IMAGE_DESCRIPTION_PROMPT = """You are given a single image that may depict a 
    - For each labeled field, heading, or identifier, specify:
      • Field name (as labeled in the document)
      • Purpose/meaning (brief explanation)
+   - Pay special attention to: prices/amounts, currency codes or symbols, dates and times, duration/intervals, addresses/locations/routes, and any check-in/check-out or departure/arrival data (tickets, bookings, boarding passes).
 
 5. Element Summary
    - Provide a comprehensive list of all mentioned elements, fields, and sections.
    - Include exact wording where present and brief context.
+   - Re-state all amounts with currency, all dates/times, any durations, and any locations/geo points mentioned.
 
 Notes:
 - Keep the description neutral and factual. Avoid identifying individuals or inferring sensitive attributes.
@@ -108,7 +137,7 @@ HTML_IMAGE_HEURISTIC_BYTES = 10000
 ARCHIVE_ALLOWED_EXTS = SUPPORTED_IMAGE_FORMATS | {
     ".pdf", ".txt", ".pages", ".numbers", ".xlsx", ".xls", ".csv", ".json", ".py",
     ".html", ".cms", ".css", ".eml", ".mbox", ".rtf", ".md", ".markdown", ".odt",
-    ".epub", ".docx", ".doc", ".pptx", ".ppt"
+    ".epub", ".docx", ".doc", ".pptx", ".ppt", ".pkpass"
 }
 
 # ----------------------------------------------------------------------
@@ -120,6 +149,13 @@ MAX_RAR_SIZE = 100 * 1024 * 1024
 MAX_RAR_FILES = 50
 # Per-member extraction limit to avoid oversized entries; set generously
 MAX_ARCHIVE_MEMBER_SIZE = 100 * 1024 * 1024
+
+# ----------------------------------------------------------------------
+# PKPASS limits
+# ----------------------------------------------------------------------
+PKPASS_MAX_ZIP_SIZE = 25 * 1024 * 1024
+PKPASS_MAX_FILES = 50
+PKPASS_MAX_ENTRY_SIZE = 2 * 1024 * 1024
 
 # ----------------------------------------------------------------------
 # Page/sheet limits
@@ -138,12 +174,8 @@ EXCEL_DIRECT_ENV_VAR = "ENABLE_DIRECT_EXCEL"
 ###############################################################################
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
-LOG_DIR = "processed_documents"
-os.makedirs(LOG_DIR, exist_ok=True)
-file_handler = logging.FileHandler(os.path.join(LOG_DIR, "processing.log"))
-file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-logger.addHandler(file_handler)
+# Use null handler to avoid writing global files; callers can configure handlers.
+logger.addHandler(logging.NullHandler())
 
 
 ###############################################################################
@@ -151,8 +183,8 @@ logger.addHandler(file_handler)
 ##############################################################################
 
 load_dotenv()
-DOCS_VISION_MODEL = os.getenv("DOCS_VISION_MODEL")
-DOCS_VISION_MODEL_ROTATE = os.getenv("DOCS_VISION_MODEL_ROTATE")
+DOCS_VISION_MODEL = os.getenv("DOCS_VISION_MODEL", "gpt-4o-2024-08-06")
+DOCS_VISION_MODEL_ROTATE = os.getenv("DOCS_VISION_MODEL_ROTATE", "gpt-4o-2024-08-06")
 
 ###############################################################################
 # Helper utilities
@@ -209,8 +241,9 @@ def _generate_unique_image_name(source_type: str, original_name: str, extension:
 
 
 def _ensure_dirs() -> None:
-    for d in ("images", "tables", LOG_DIR):
-        os.makedirs(d, exist_ok=True)
+    # Instance-specific directories are created in Document.__init__;
+    # keep this as a no-op to avoid global, shared folders.
+    return
 
 
 def _save_binary(content: bytes, dest_path: str) -> None:
@@ -272,9 +305,10 @@ def _find_soffice() -> str:
     for p in candidates:
         if p and os.path.isfile(p):
             return p
-    raise FileNotFoundError(
-        "LibreOffice 'soffice' executable not found. Install LibreOffice or set env var SOFFICE_PATH."
-    )
+    # raise FileNotFoundError(
+    #     "LibreOffice 'soffice' executable not found. Install LibreOffice or set env var SOFFICE_PATH."
+    # )
+    return ""
 
 
 @lru_cache(maxsize=1)
@@ -387,8 +421,19 @@ class Document:
     def __init__(self, file_path: str, *, media_dir: str = "media_for_processing") -> None:
         self.media_dir = media_dir
         os.makedirs(self.media_dir, exist_ok=True)
+        # Per-task subfolders to isolate artifacts
+        self.images_dir = os.path.join(self.media_dir, "images")
+        self.tables_dir = os.path.join(self.media_dir, "tables")
+        self.logs_dir = os.path.join(self.media_dir, "logs")
+        os.makedirs(self.images_dir, exist_ok=True)
+        os.makedirs(self.tables_dir, exist_ok=True)
+        os.makedirs(self.logs_dir, exist_ok=True)
         if not file_path.startswith(self.media_dir):
-            self.file_path = os.path.join(self.media_dir, os.path.basename(file_path))
+            # Avoid moving file if it's already there or an absolute path we want to process in-place
+            # But for simplicity, let's assume we copy it to media_dir if not present
+            # self.file_path = os.path.join(self.media_dir, os.path.basename(file_path))
+            # For backend usage, we might process directly in place
+            self.file_path = file_path
         else:
             self.file_path = file_path
         self.file_name = os.path.basename(self.file_path)
@@ -412,6 +457,7 @@ class Document:
         _ensure_dirs()
         HANDLERS = {
             ".pdf": self._process_pdf,
+            ".pkpass": self._process_pkpass,
             ".txt": self._process_txt,
             ".pages": self._process_pages,
             ".numbers": self._process_numbers,
@@ -440,18 +486,166 @@ class Document:
         elif ext in {".xlsx", ".xls"} and _is_direct_excel_enabled():
             handler = self._process_spreadsheet
         elif ext in {".docx", ".doc", ".pptx", ".ppt", ".xls", ".xlsx"}:
-            pdf_path = self._convert_to_pdf(self.file_path)
-            self.file_path, self.file_name, self.file_ext = pdf_path, os.path.basename(pdf_path), ".pdf"
-            handler = self._process_pdf
+            # Try to convert to PDF if libreoffice is available
+            soffice = _find_soffice()
+            if soffice:
+                pdf_path = self._convert_to_pdf(self.file_path)
+                self.file_path, self.file_name, self.file_ext = pdf_path, os.path.basename(pdf_path), ".pdf"
+                handler = self._process_pdf
+            else:
+                 # Fallback or skip
+                 logger.warning("LibreOffice not found, skipping conversion for %s", ext)
+                 self.text_content = f"(Skipped: LibreOffice not found for {ext})"
+                 return
         else:
             handler = HANDLERS.get(ext)
         if not handler:
-            raise ValueError(f"Unsupported file format: {ext}")
+            # raise ValueError(f"Unsupported file format: {ext}")
+            logger.warning("Unsupported file format: %s", ext)
+            self.text_content = f"(Unsupported file format: {ext})"
+            return
+
         handler()
 
     # --------------------------
     # Format-specific methods
     # --------------------------
+
+    def _process_pkpass(self) -> None:
+        logger.info("Processing PKPASS file %s", self.file_path)
+        if self.file_size > PKPASS_MAX_ZIP_SIZE:
+            msg = (f"(pkpass skipped: size {self.file_size} B > {PKPASS_MAX_ZIP_SIZE} B limit)")
+            logger.warning("%s %s", self.file_name, msg)
+            self.text_content = msg
+            return
+        if not zipfile.is_zipfile(self.file_path):
+            self.text_content = "(pkpass is not a valid zip archive)"
+            return
+        try:
+            with zipfile.ZipFile(self.file_path, "r") as z:
+                names = [n for n in z.namelist() if not n.endswith("/")]
+                if len(names) > PKPASS_MAX_FILES:
+                    logger.info("PKPASS %s has %d entries; only pass.json will be read", self.file_name, len(names))
+                pass_candidates = [n for n in names if n.lower().endswith("pass.json")]
+                if not pass_candidates:
+                    self.text_content = "(pkpass missing pass.json)"
+                    self._inject_basic_metadata()
+                    return
+                pass_name = sorted(pass_candidates, key=lambda x: (len(x), x))[0]
+                info = z.getinfo(pass_name)
+                if info.file_size > PKPASS_MAX_ENTRY_SIZE:
+                    self.text_content = (
+                        f"(pkpass pass.json too large: {info.file_size} B > {PKPASS_MAX_ENTRY_SIZE} B)"
+                    )
+                    self._inject_basic_metadata()
+                    return
+                with z.open(pass_name) as f:
+                    raw = f.read(PKPASS_MAX_ENTRY_SIZE + 1)
+                if len(raw) > PKPASS_MAX_ENTRY_SIZE:
+                    self.text_content = (
+                        f"(pkpass pass.json too large: > {PKPASS_MAX_ENTRY_SIZE} B)"
+                    )
+                    self._inject_basic_metadata()
+                    return
+                try:
+                    data = json.loads(raw.decode("utf-8", errors="ignore"))
+                except json.JSONDecodeError:
+                    self.text_content = "(pkpass pass.json unreadable)"
+                    self._inject_basic_metadata()
+                    return
+        except Exception as e:
+            logger.error("Failed to read pkpass %s: %s", self.file_name, e)
+            self.text_content = f"(pkpass read failed: {e})"
+            return
+
+        def normalize_value(value, max_len: int = 1000) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, (dict, list)):
+                text = json.dumps(value, ensure_ascii=False)
+            else:
+                text = str(value)
+            text = text.strip()
+            if len(text) > max_len:
+                return text[:max_len] + "...(truncated)"
+            return text
+
+        def add_line(lines: List[str], label: str, value) -> None:
+            text = normalize_value(value)
+            if text:
+                lines.append(f"{label}: {text}")
+
+        lines: List[str] = []
+        lines.append("==== PKPASS ====")
+        add_line(lines, "Organization", data.get("organizationName"))
+        add_line(lines, "Description", data.get("description"))
+        add_line(lines, "Serial number", data.get("serialNumber"))
+        add_line(lines, "Pass type id", data.get("passTypeIdentifier"))
+        add_line(lines, "Team id", data.get("teamIdentifier"))
+        add_line(lines, "Relevant date", data.get("relevantDate"))
+        add_line(lines, "Expiration date", data.get("expirationDate"))
+        add_line(lines, "Relevant text", data.get("relevantText"))
+
+        pass_type = None
+        for candidate in ("boardingPass", "eventTicket", "coupon", "storeCard", "generic"):
+            if candidate in data:
+                pass_type = candidate
+                break
+        add_line(lines, "Pass type", pass_type)
+
+        barcodes = data.get("barcodes")
+        if not barcodes and data.get("barcode"):
+            barcodes = [data.get("barcode")]
+        if isinstance(barcodes, list) and barcodes:
+            lines.append("-- Barcodes --")
+            for idx, barcode in enumerate(barcodes, start=1):
+                if not isinstance(barcode, dict):
+                    continue
+                parts = []
+                fmt = normalize_value(barcode.get("format"), max_len=200)
+                msg = normalize_value(barcode.get("message"), max_len=500)
+                alt = normalize_value(barcode.get("altText"), max_len=200)
+                if fmt:
+                    parts.append(f"format={fmt}")
+                if msg:
+                    parts.append(f"message={msg}")
+                if alt:
+                    parts.append(f"altText={alt}")
+                if parts:
+                    lines.append(f"Barcode {idx}: {', '.join(parts)}")
+
+        locations = data.get("locations")
+        if isinstance(locations, list) and locations:
+            lines.append("-- Locations --")
+            for idx, loc in enumerate(locations, start=1):
+                if not isinstance(loc, dict):
+                    continue
+                lat = normalize_value(loc.get("latitude"), max_len=200)
+                lon = normalize_value(loc.get("longitude"), max_len=200)
+                rel = normalize_value(loc.get("relevantText"), max_len=200)
+                if lat or lon or rel:
+                    lines.append(f"Location {idx}: lat={lat} lon={lon} text={rel}")
+
+        def append_fields(section_name: str, fields: list) -> None:
+            if not fields:
+                return
+            lines.append(f"-- {section_name} --")
+            for field in fields:
+                if not isinstance(field, dict):
+                    continue
+                label = field.get("label") or field.get("key") or "field"
+                value = field.get("value")
+                add_line(lines, normalize_value(label, max_len=200), value)
+
+        section = data.get(pass_type) if pass_type else None
+        if isinstance(section, dict):
+            append_fields("Primary fields", section.get("primaryFields") or [])
+            append_fields("Secondary fields", section.get("secondaryFields") or [])
+            append_fields("Auxiliary fields", section.get("auxiliaryFields") or [])
+            append_fields("Back fields", section.get("backFields") or [])
+
+        self.text_content = "\n".join(lines).strip()
+        self._inject_basic_metadata()
 
     def _process_pdf(self) -> None:
         logger.info("Processing PDF document %s", self.file_path)
@@ -485,12 +679,20 @@ class Document:
                 try:
                     pix = page.get_pixmap(dpi=200)
                     unique_name = _generate_unique_image_name("pdf", f"{os.path.splitext(self.file_name)[0]}_page{page_number + 1}", "png")
-                    img_path = os.path.join("images", unique_name)
+                    img_path = os.path.join(self.images_dir, unique_name)
                     _save_image_data(pix, img_path)
                     self.images.append(img_path)
                     desc = self._generate_image_description(img_path)
                     parts.append(f"[========[Page {page_number + 1} with graphics]======== \n {desc}]\n")
                     logger.debug("Description for page %d with graphics added", page_number + 1)
+                    if has_text:
+                        parts.append("========[Text extracted from graphics page]========\n")
+                        for block in blocks:
+                            if block.get("type") == 0:
+                                for line in block.get("lines", []):
+                                    for span in line.get("spans", []):
+                                        parts.append(span.get("text", ""))
+                        parts.append("\n")
                 except Exception as e:
                     logger.error("Pixmap error p.%s: %s", page_number + 1, e)
                     logger.debug("Error processing page %d image with graphics", page_number + 1)
@@ -514,7 +716,7 @@ class Document:
                         img_ext = block.get("ext", "png")
                         base_name = f"{os.path.splitext(self.file_name)[0]}_img{image_counter}"
                         unique_name = _generate_unique_image_name("pdf", base_name, img_ext)
-                        img_path = os.path.join("images", unique_name)
+                        img_path = os.path.join(self.images_dir, unique_name)
                         try:
                             _save_image_data(img_bytes, img_path)
                             self.images.append(img_path)
@@ -542,6 +744,7 @@ class Document:
             img = Image.open(self.file_path)
         except Exception as e:
             raise ValueError(f"Cannot open image '{self.file_name}': {e}")
+        original_format = img.format or "UNKNOWN"
         try:
             exif = img.getexif()
             if exif and exif.get(274):
@@ -550,11 +753,22 @@ class Document:
             pass
         if max(img.size) > MAX_IMAGE_DIM or self.file_size > MAX_IMAGE_SIZE:
             img.thumbnail((MAX_IMAGE_DIM, MAX_IMAGE_DIM))
-        fmt = "JPEG" if img.format and img.format.lower() in {"tiff", "tif"} else (img.format or "PNG")
+        # Normalize to standard JPEG for Vision API compatibility.
+        # MPO (iPhone multi-picture), TIFF, BMP etc. are converted to JPEG.
+        # PNG is kept as-is (supports transparency).
+        if original_format.upper() in {"PNG"}:
+            fmt = "PNG"
+        else:
+            fmt = "JPEG"
+        # Ensure RGB mode for JPEG (no alpha channel, no palette)
+        if fmt == "JPEG" and img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        if original_format.upper() != fmt:
+            logger.info("Image format normalized: %s -> %s (%s)", original_format, fmt, self.file_name)
         base_name = os.path.splitext(self.file_name)[0]
         unique_name = _generate_unique_image_name("direct", base_name, fmt.lower())
-        out_path = os.path.join("images", unique_name)
-        _save_image_data(img, out_path)
+        out_path = os.path.join(self.images_dir, unique_name)
+        img.save(out_path, format=fmt, quality=90)
         self.images.append(out_path)
         exif_data: Dict[str, str] = {}
         try:
@@ -587,8 +801,8 @@ class Document:
                 df = read_excel_file_safe(self.file_path, sheet_name=sheet_name)
                 if df.empty:
                     continue
-                csv_path = os.path.join("tables", f"{base}_{sheet_name}.csv")
-                os.makedirs("tables", exist_ok=True)
+                csv_path = os.path.join(self.tables_dir, f"{base}_{sheet_name}.csv")
+                os.makedirs(self.tables_dir, exist_ok=True)
                 df.to_csv(csv_path, index=False)
                 self.tables.append(csv_path)
                 previews.extend(_csv_previews(df, f"Sheet: {sheet_name}"))
@@ -599,7 +813,7 @@ class Document:
 
     def _process_csv(self) -> None:
         df = pd.read_csv(self.file_path)
-        csv_copy = os.path.join("tables", os.path.basename(self.file_path))
+        csv_copy = os.path.join(self.tables_dir, os.path.basename(self.file_path))
         df.to_csv(csv_copy, index=False)
         self.tables.append(csv_copy)
         full_csv = df.to_csv(index=False)
@@ -709,10 +923,10 @@ class Document:
                         str_headers.append(key)
 
                     try:
-                        os.makedirs("tables", exist_ok=True)
+                        os.makedirs(self.tables_dir, exist_ok=True)
                         safe_sheet = _safe_name(str(sheet_name))
                         safe_table = _safe_name(str(table_name))
-                        csv_path = os.path.join("tables", f"{base_name}_{safe_sheet}_{safe_table}.csv")
+                        csv_path = os.path.join(self.tables_dir, f"{base_name}_{safe_sheet}_{safe_table}.csv")
                         df = pd.DataFrame(data_rows, columns=str_headers)
                         df.to_csv(csv_path, index=False)
                         self.tables.append(csv_path)
@@ -769,7 +983,7 @@ class Document:
                 original_name = os.path.splitext(os.path.basename(jpg_files[0]))[0]
                 extension = os.path.splitext(jpg_files[0])[1][1:]
                 unique_name = _generate_unique_image_name("archive", original_name, extension)
-                img_path = os.path.join("images", unique_name)
+                img_path = os.path.join(self.images_dir, unique_name)
                 _save_binary(data, img_path)
                 self.images.append(img_path)
                 self.text_content += f"{self._generate_image_description(img_path)} (Image saved to: {img_path})\n"
@@ -780,10 +994,27 @@ class Document:
                 self.text_content += "(XML not found in bundle)"
         self._inject_basic_metadata()
 
-    def _convert_to_pdf(self, path: str) -> str:
+    def _convert_to_pdf(self, path: str, timeout: int = 120) -> str:
+        """
+        Convert document to PDF using LibreOffice.
+
+        Phase 1.1: Added timeout to prevent indefinite hangs.
+        Args:
+            path: Path to document
+            timeout: Max seconds to wait (default 120)
+        """
         soffice = _find_soffice()
         output_dir = os.path.dirname(path)
-        subprocess.run([soffice, "--headless", "--convert-to", "pdf", "--outdir", output_dir, path], check=True)
+        try:
+            subprocess.run(
+                [soffice, "--headless", "--convert-to", "pdf", "--outdir", output_dir, path],
+                check=True,
+                timeout=timeout,
+                capture_output=True
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("LibreOffice conversion timed out after %ds for %s", timeout, path)
+            raise TimeoutError(f"LibreOffice conversion timed out after {timeout}s")
         pdf_path = os.path.splitext(path)[0] + ".pdf"
         logger.debug("Converted '%s' to PDF via %s", path, soffice)
         return pdf_path
@@ -796,30 +1027,36 @@ class Document:
         """
         Detect image orientation from base64, rotate in-memory, return new base64.
         Returns original base64 on error or angle=0.
+        Uses DOCS_VISION_MODEL_ROTATE from .env as the single source of truth.
         """
         api_key = _get_api_key()
         if not api_key:
             logger.warning("API_KEY not set; skipping image orientation fix.")
             return b64_string
-        client = OpenAI(api_key=api_key)
+        llm = LLMConfig(model=model)
         try:
-            completion = client.chat.completions.create(
-                model=model,
-                response_format={"type": "json_object"},
+            response_content = llm.get_completion(
                 messages=[
-                    {"role": "system", "content": "You are a helpful assistant that detects image orientation and responds in JSON."},
+                    {"role": "system", "content": "Return only one integer: 0, 90, 180, or 270. This is the clockwise rotation needed to make the document upright."},
                     {"role": "user", "content": [
-                        {"type": "text", "text": "Detect the clockwise rotation (0, 90, 180, 270) needed to make the document upright. Return {\"angle\": <int>}"},
+                        {"type": "text", "text": "Clockwise rotation? Return just the number (0/90/180/270)."},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_string}"}},
                     ]},
                 ],
-                max_tokens=100,
-                temperature=0,
-                timeout=timeout,
+                max_tokens=20,
+                temperature=None,
             )
-            response_content = completion.choices[0].message.content
-            angle_json = json.loads(response_content)
-            angle = angle_json.get("angle")
+            # Accept either plain string or JSON-like dict
+            if isinstance(response_content, dict):
+                angle = response_content.get("angle")
+            else:
+                try:
+                    angle = int(str(response_content).strip())
+                except Exception:
+                    try:
+                        angle = json.loads(response_content).get("angle")
+                    except Exception:
+                        angle = None
             if angle in {90, 180, 270}:
                 image_data = base64.b64decode(b64_string)
                 img = Image.open(io.BytesIO(image_data))
@@ -834,29 +1071,33 @@ class Document:
             return b64_string
 
     def _generate_image_description(self, image_path: str, *, model: str = DOCS_VISION_MODEL, max_tokens: int = 5000, timeout: float = 180) -> str:
+        """
+        Uses DOCS_VISION_MODEL from .env as the single source of truth.
+        """
         api_key = _get_api_key()
         if not api_key:
             logger.warning("API_KEY not set; skipping Vision description.")
             return "(description unavailable)"
-        client = OpenAI(api_key=api_key)
         with open(image_path, "rb") as img_file:
             b64 = base64.b64encode(img_file.read()).decode()
         # Correct orientation before sending to description
         b64 = self._fix_image_orientation(b64_string=b64)
+        # Detect MIME type from file extension
+        ext = os.path.splitext(image_path)[1].lower()
+        mime_type = "image/png" if ext == ".png" else "image/jpeg"
+        llm = LLMConfig(model=model)
         try:
-            completion = client.chat.completions.create(
-                model=model,
+            completion = llm.get_completion(
                 messages=[
                     {"role": "user", "content": [
                         {"type": "text", "text": AI_IMAGE_DESCRIPTION_PROMPT},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}},
                     ]}
                 ],
                 max_tokens=max_tokens,
                 temperature=0,
-                timeout=timeout,
             )
-            return completion.choices[0].message.content.strip()
+            return completion.strip() if isinstance(completion, str) else str(completion)
         except Exception as e:
             logger.error("OpenAI image description failed: %s", e)
             return "(description failed)"
@@ -1184,10 +1425,3 @@ def batch_process_folder(
             f.write("\n".join(results))
         print(f"Batch processing completed. Report at {output_file}")
     return docs
-
-
-if __name__ == "__main__":
-    batch_process_folder(
-        "downloaded_files",
-        os.path.join("processed_documents_21_04", "final_output_21_04_94.txt"),
-    )
